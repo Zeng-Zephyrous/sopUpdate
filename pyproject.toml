@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sop-update"
+version = "0.1.0"
+description = "Export complete tagged Dify DSL dependency trees through a persistent browser session."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+	"playwright>=1.40",
+	"PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+sop-update = "sop_update:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
