@@ -5,8 +5,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-from sop_update.console_client import ConsoleApiError, ConsoleSession
-from sop_update.exporter import ExportError, export_complete_dsl
+from dsl_export.console_client import ConsoleApiError, ConsoleSession
+from dsl_export.exporter import ExportError, export_complete_dsl
 
 
 def build_parser() -> argparse.ArgumentParser:

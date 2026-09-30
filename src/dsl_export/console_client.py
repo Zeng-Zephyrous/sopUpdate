@@ -17,7 +17,7 @@ LOGIN_TIMEOUT_SECONDS = 600
 SESSION_RENEWAL_SECONDS = 25
 EXPORT_INTERVAL_SECONDS = 0.75
 PERSISTED_LOGIN_SECONDS = 30 * 60
-SESSION_METADATA_FILE = ".sop-update-session.json"
+SESSION_METADATA_FILE = ".dsl-export-session.json"
 RENEWABLE_COOKIES = {"__Host-refresh_token", "ESTSAUTHPERSISTENT"}
 CSRF_NAMES = {"csrf_token", "csrftoken", "x-csrf-token", "xsrf-token", "_csrf", "csrf"}
 

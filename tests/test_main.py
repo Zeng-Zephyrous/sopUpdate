@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from sop_update.console_client import ConsoleSession, PERSISTED_LOGIN_SECONDS
-from sop_update.exporter import ExportError, export_complete_dsl
+from dsl_export.console_client import ConsoleSession, PERSISTED_LOGIN_SECONDS
+from dsl_export.exporter import ExportError, export_complete_dsl
 
 
 class FakeAPI:
@@ -65,13 +65,13 @@ workflow:
 
 def test_persisted_login_expires_after_30_minutes(monkeypatch, tmp_path) -> None:
     session = ConsoleSession("https://dify.example.com", tmp_path)
-    monkeypatch.setattr("sop_update.console_client.time.time", lambda: 10_000.0)
+    monkeypatch.setattr("dsl_export.console_client.time.time", lambda: 10_000.0)
 
     session._mark_login_persisted()
     assert session._persisted_login_is_fresh()
 
     monkeypatch.setattr(
-        "sop_update.console_client.time.time",
+        "dsl_export.console_client.time.time",
         lambda: 10_000.0 + PERSISTED_LOGIN_SECONDS,
     )
     assert not session._persisted_login_is_fresh()
@@ -108,7 +108,7 @@ def test_requires_name_to_match_within_tag(tmp_path) -> None:
 
 
 def test_main_switches_workspace_and_exports(monkeypatch, tmp_path) -> None:
-    main_module = importlib.import_module("sop_update.main")
+    main_module = importlib.import_module("dsl_export.main")
     events = []
 
     class FakeSession:

@@ -24,7 +24,7 @@ python -m playwright install chromium
 ## 导出 DSL
 
 ```powershell
-python -m sop_update `
+python -m dsl_export `
 	--endpoint "https://dify-devs.maersk-digital.net" `
 	--name "BL Enquiry" `
 	--tag "cn_bl_enquiry_v1_0" `
@@ -50,12 +50,12 @@ python -m sop_update `
 Completed: 2 DSL file(s); manifest: exports\BL-Enquiry\manifest.json
 ```
 
-安装项目后也可以使用 `sop-update` 运行同样的参数：
+安装项目后也可以使用 `dsl-export` 运行同样的参数：
 
 ```powershell
-sop-update --endpoint "https://dify-devs.maersk-digital.net" --name "BL Enquiry endpoint" --tag "cn_bl_enquiry_v1_0" --workspace "CX Emails - China" --output ".\exports\BL-Enquiry"
+dsl-export --endpoint "https://dify-devs.maersk-digital.net" --name "BL Enquiry endpoint" --tag "cn_bl_enquiry_v1_0" --workspace "CX Emails - China" --output ".\exports\BL-Enquiry"
 ```
-sop-update --endpoint "https://dify-devs.maersk-digital.net" --name "split combine endpoint" --tag "cn_split_combine_v1_0" --workspace "CX Emails - China" --output ".\exports\split combine"
+dsl-export --endpoint "https://dify-devs.maersk-digital.net" --name "split combine endpoint" --tag "cn_split_combine_v1_0" --workspace "CX Emails - China" --output ".\exports\split combine"
 
 
 ## 参数

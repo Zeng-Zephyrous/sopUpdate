@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sop-update"
+name = "dsl-export"
 version = "0.1.0"
 description = "Export complete tagged Dify DSL dependency trees through a persistent browser session."
 readme = "README.md"
@@ -17,7 +17,7 @@ dependencies = [
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-sop-update = "sop_update:main"
+dsl-export = "dsl_export:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
