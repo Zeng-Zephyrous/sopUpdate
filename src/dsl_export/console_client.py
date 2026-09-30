@@ -131,6 +131,18 @@ class ConsoleSession:
         except PlaywrightError:
             self.page = self._live_page()
 
+    def _continue_headless_after_login(self) -> None:
+        self.context.close()
+        self.context = self._launch_context(headless=True)
+        self.page = self._live_page()
+        self._open_console()
+        ok, detail = self._probe_logged_in()
+        if not ok:
+            raise ConsoleApiError(
+                f"Login was lost while closing the visible browser: {detail}"
+            )
+        self.log("Login confirmed; closed the visible Edge window.")
+
     def _probe_logged_in(self) -> tuple[bool, str]:
         try:
             query = urlencode({"page": 1, "limit": 1, "name": ""})
@@ -176,7 +188,7 @@ class ConsoleSession:
             ok, _ = self._probe_logged_in()
             if ok:
                 self._mark_login_persisted()
-                self.log("Login confirmed.")
+                self._continue_headless_after_login()
                 return
         raise ConsoleApiError(
             f"Login was not detected within {self.login_timeout} seconds"
@@ -347,23 +359,17 @@ class ConsoleSession:
                 ),
                 [],
             )
+        return tools
 
-        enriched: list[dict[str, Any]] = []
-        for tool in tools:
-            tool_id = tool.get("id")
-            if not tool_id:
-                enriched.append(tool)
-                continue
-            try:
-                detail = self._request_json(
-                    "/workspaces/current/tool-provider/workflow/get?"
-                    + urlencode({"workflow_tool_id": tool_id})
-                )
-            except ConsoleApiError:
-                enriched.append(tool)
-            else:
-                enriched.append({**tool, **detail})
-        return enriched
+    def get_workflow_tool(self, tool_id: str) -> dict[str, Any]:
+        try:
+            payload = self._request_json(
+                "/workspaces/current/tool-provider/workflow/get?"
+                + urlencode({"workflow_tool_id": tool_id})
+            )
+        except ConsoleApiError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
 
     def list_workspaces(self) -> list[dict[str, Any]]:
         payload = self._request_json("/workspaces", allow_list=True)

@@ -10,6 +10,9 @@ from dsl_export.exporter import ExportError, export_complete_dsl
 class FakeAPI:
     endpoint = "https://dify.example.com"
 
+    def __init__(self):
+        self.tool_detail_requests = []
+
     def list_tags(self):
         return [{"id": "tag-1", "name": "release-1"}]
 
@@ -26,7 +29,6 @@ class FakeAPI:
             {
                 "id": "tool-child",
                 "name": "old-child-name",
-                "workflow_app_id": "app-child",
             },
             {
                 "id": "tool-grandchild",
@@ -34,6 +36,10 @@ class FakeAPI:
                 "workflow_app_id": "app-grandchild",
             },
         ]
+
+    def get_workflow_tool(self, tool_id):
+        self.tool_detail_requests.append(tool_id)
+        return {"workflow_app_id": "app-child"}
 
     def export_dsl(self, app_id):
         if app_id == "app-parent":
@@ -84,10 +90,45 @@ def test_persisted_login_expires_after_30_minutes(monkeypatch, tmp_path) -> None
     assert not stale_file.exists()
 
 
+def test_visible_browser_closes_and_export_continues_headless(
+    monkeypatch, tmp_path
+) -> None:
+    session = ConsoleSession("https://dify.example.com", tmp_path)
+    launches = []
+
+    class VisibleContext:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    visible_context = VisibleContext()
+    headless_context = object()
+    page = object()
+    session.context = visible_context
+
+    monkeypatch.setattr(
+        session,
+        "_launch_context",
+        lambda *, headless: launches.append(headless) or headless_context,
+    )
+    monkeypatch.setattr(session, "_live_page", lambda: page)
+    monkeypatch.setattr(session, "_open_console", lambda: None)
+    monkeypatch.setattr(session, "_probe_logged_in", lambda: (True, ""))
+
+    session._continue_headless_after_login()
+
+    assert visible_context.closed
+    assert launches == [True]
+    assert session.context is headless_context
+    assert session.page is page
+
+
 def test_exports_named_tagged_app_and_recursive_dependency(tmp_path) -> None:
     progress = []
+    api = FakeAPI()
     manifest = export_complete_dsl(
-        FakeAPI(), "Parent", "release-1", tmp_path, log=progress.append
+        api, "Parent", "release-1", tmp_path, log=progress.append
     )
 
     assert manifest["workflow_count"] == 3
@@ -100,6 +141,7 @@ def test_exports_named_tagged_app_and_recursive_dependency(tmp_path) -> None:
     assert any("[1] Pulling DSL: Parent" in line for line in progress)
     assert any("Renamed Child.yml" in line for line in progress)
     assert any("manifest.json" in line for line in progress)
+    assert api.tool_detail_requests == ["tool-child"]
 
 
 def test_requires_name_to_match_within_tag(tmp_path) -> None:

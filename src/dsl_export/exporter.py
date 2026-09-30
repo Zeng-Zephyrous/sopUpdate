@@ -22,6 +22,8 @@ class ExportAPI(Protocol):
 
     def list_workflow_tools(self) -> list[dict[str, Any]]: ...
 
+    def get_workflow_tool(self, tool_id: str) -> dict[str, Any]: ...
+
     def export_dsl(self, app_id: str) -> str: ...
 
 
@@ -63,6 +65,7 @@ def _resolve_dependency(
     tools: list[dict[str, Any]],
     name: str | None,
     provider_id: str | None,
+    load_tool_detail: Callable[[str], dict[str, Any]],
 ) -> dict[str, Any] | None:
     if name:
         matches = [app for app in apps if app.get("name") == name]
@@ -90,6 +93,10 @@ def _resolve_dependency(
     )
     if tool is None:
         return None
+
+    tool_id = tool.get("id") or tool.get("workflow_tool_id")
+    if tool_id and not (tool.get("workflow_app_id") or tool.get("app_id")):
+        tool = {**tool, **load_tool_detail(str(tool_id))}
 
     app_id = tool.get("workflow_app_id") or tool.get("app_id")
     if app_id:
@@ -139,11 +146,19 @@ def export_complete_dsl(
 ) -> dict[str, Any]:
     log(f"Finding app {app_name!r} with tag {tag_name!r}...")
     root, _ = _select_root(api, app_name, tag_name)
-    log("Loading workspace apps and workflow-tool registry...")
+    log("Loading workspace app index...")
     all_apps = api.list_apps()
+    log(f"Loaded {len(all_apps)} apps; loading workflow-tool index...")
     tools = api.list_workflow_tools()
+    log(f"Loaded {len(tools)} workflow tools; details will be fetched on demand.")
     apps_by_id = {app["id"]: app for app in all_apps}
     apps_by_id.setdefault(root["id"], root)
+    tool_details: dict[str, dict[str, Any]] = {}
+
+    def load_tool_detail(tool_id: str) -> dict[str, Any]:
+        if tool_id not in tool_details:
+            tool_details[tool_id] = api.get_workflow_tool(tool_id)
+        return tool_details[tool_id]
 
     queue = deque([(root, True)])
     seen: set[str] = set()
@@ -170,7 +185,11 @@ def export_complete_dsl(
             _dependency_refs(dsl_text), key=lambda item: (item[0] or "", item[1] or "")
         ):
             dependency = _resolve_dependency(
-                list(apps_by_id.values()), tools, provider_name, provider_id
+                list(apps_by_id.values()),
+                tools,
+                provider_name,
+                provider_id,
+                load_tool_detail,
             )
             if dependency is None:
                 unresolved.add(provider_name or provider_id or "unknown")
