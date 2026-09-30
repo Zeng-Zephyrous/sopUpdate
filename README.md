@@ -80,6 +80,27 @@ dsl-export --endpoint "https://dify-devs.maersk-digital.net" --name "split combi
 
 输出可能包含密钥，`exports/`、`dify-dsl-export/` 和浏览器 Profile 已加入 `.gitignore`，不要提交到 Git。
 
+## 按 Case Number 导出完整日志
+
+`dify-log-search` 先在指定根应用的生产日志中搜索 Case Number，再从根运行详情和节点执行结果中提取子 Workflow Run ID，递归导出可精确定位的完整日志树。
+
+```powershell
+dify-log-search `
+	--endpoint "https://dify-devs.maersk-digital.net" `
+	--app "split combine endpoint" `
+	--case-num "123456789" `
+	--workspace "CX Emails - China" `
+	--output ".\dify-log-search"
+```
+
+输出位于 `<output>/<case-num>/`：
+
+- 每个运行生成一个 JSON，包含完整 `workflow_run` 和 `node_executions`。
+- `manifest.json` 记录根运行、父子运行关系和无法通过精确 ID 定位的节点。
+- `--max-results` 限制同一 Case Number 的根运行数量，默认 20。
+
+该功能只递归跟踪节点数据中明确存在的子 Run ID，不使用时间窗口猜测，以免混入其他 Case 的相邻日志。完整日志可能包含客户信息或内部数据，`dify-log-search/` 已加入 `.gitignore`。
+
 ## 测试
 
 ```powershell

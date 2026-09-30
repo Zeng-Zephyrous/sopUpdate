@@ -62,7 +62,7 @@ def _label(entry: dict[str, Any]) -> str | None:
 
 def _resolve_dependency(
     apps: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
+    load_tools: Callable[[], list[dict[str, Any]]],
     name: str | None,
     provider_id: str | None,
     load_tool_detail: Callable[[str], dict[str, Any]],
@@ -74,6 +74,7 @@ def _resolve_dependency(
         if len(matches) > 1:
             raise ExportError(f"Multiple apps are named {name!r}")
 
+    tools = load_tools()
     tool = next(
         (
             entry
@@ -148,12 +149,19 @@ def export_complete_dsl(
     root, _ = _select_root(api, app_name, tag_name)
     log("Loading workspace app index...")
     all_apps = api.list_apps()
-    log(f"Loaded {len(all_apps)} apps; loading workflow-tool index...")
-    tools = api.list_workflow_tools()
-    log(f"Loaded {len(tools)} workflow tools; details will be fetched on demand.")
+    log(f"Loaded {len(all_apps)} apps; workflow tools will be loaded on demand.")
     apps_by_id = {app["id"]: app for app in all_apps}
     apps_by_id.setdefault(root["id"], root)
+    tools: list[dict[str, Any]] | None = None
     tool_details: dict[str, dict[str, Any]] = {}
+
+    def load_tools() -> list[dict[str, Any]]:
+        nonlocal tools
+        if tools is None:
+            log("Loading workflow-tool index for an unresolved app name...")
+            tools = api.list_workflow_tools()
+            log(f"Loaded {len(tools)} workflow tools.")
+        return tools
 
     def load_tool_detail(tool_id: str) -> dict[str, Any]:
         if tool_id not in tool_details:
@@ -186,7 +194,7 @@ def export_complete_dsl(
         ):
             dependency = _resolve_dependency(
                 list(apps_by_id.values()),
-                tools,
+                load_tools,
                 provider_name,
                 provider_id,
                 load_tool_detail,

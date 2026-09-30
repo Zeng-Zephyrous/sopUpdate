@@ -15,7 +15,8 @@ PAGE_SIZE = 100
 LOGIN_POLL_SECONDS = 2
 LOGIN_TIMEOUT_SECONDS = 600
 SESSION_RENEWAL_SECONDS = 25
-EXPORT_INTERVAL_SECONDS = 0.75
+API_RETRY_DELAYS = (0.5, 1.0, 2.0)
+RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 PERSISTED_LOGIN_SECONDS = 30 * 60
 SESSION_METADATA_FILE = ".dsl-export-session.json"
 RENEWABLE_COOKIES = {"__Host-refresh_token", "ESTSAUTHPERSISTENT"}
@@ -53,7 +54,6 @@ class ConsoleSession:
         self._playwright = None
         self.context = None
         self.page: Page | None = None
-        self._last_export_at: float | None = None
 
     def __enter__(self) -> ConsoleSession:
         self._prepare_profile()
@@ -229,20 +229,37 @@ class ConsoleSession:
         url = f"{self.endpoint}{CONSOLE_API_PREFIX}{path}"
         csrf_headers = self._csrf_headers()
         errors: list[str] = []
-        attempts = (
-            lambda: self._via_context(url, method, body, csrf_headers),
-            lambda: self._via_page(url, method, body, csrf_headers),
-        )
-        for attempt in attempts:
-            response = attempt()
-            payload = response["json"]
-            valid = isinstance(payload, dict) or (allow_list and isinstance(payload, list))
-            if response["ok"] and valid:
-                return payload
-            errors.append(
-                f"{response['strategy']}: HTTP {response['status']} "
-                f"{response['text'][:200]!r}"
+        for retry_number in range(len(API_RETRY_DELAYS) + 1):
+            responses: list[dict[str, Any]] = []
+            attempts = (
+                lambda: self._via_context(url, method, body, csrf_headers),
+                lambda: self._via_page(url, method, body, csrf_headers),
             )
+            for attempt in attempts:
+                response = attempt()
+                responses.append(response)
+                payload = response["json"]
+                valid = isinstance(payload, dict) or (
+                    allow_list and isinstance(payload, list)
+                )
+                if response["ok"] and valid:
+                    return payload
+                errors.append(
+                    f"{response['strategy']}: HTTP {response['status']} "
+                    f"{response['text'][:200]!r}"
+                )
+            statuses = {response["status"] for response in responses}
+            if (
+                retry_number == len(API_RETRY_DELAYS)
+                or not statuses
+                or not statuses.issubset(RETRYABLE_STATUS_CODES)
+            ):
+                break
+            delay = API_RETRY_DELAYS[retry_number]
+            self.log(
+                f"Dify API is busy (HTTP {min(statuses)}); retrying in {delay:g}s..."
+            )
+            time.sleep(delay)
         raise ConsoleApiError(" | ".join(errors))
 
     def _via_context(
@@ -371,6 +388,49 @@ class ConsoleSession:
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    def list_workflow_logs(
+        self,
+        app_id: str,
+        keyword: str,
+        *,
+        page: int = 1,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        payload = self._request_json(
+            f"/apps/{app_id}/workflow-app-logs?"
+            + urlencode(
+                {
+                    "page": page,
+                    "limit": limit,
+                    "keyword": keyword,
+                    "detail": "true",
+                }
+            )
+        )
+        if not isinstance(payload, dict):
+            raise ConsoleApiError(f"Unexpected workflow log response: {payload!r}")
+        return payload
+
+    def get_workflow_run(self, app_id: str, run_id: str) -> dict[str, Any]:
+        payload = self._request_json(f"/apps/{app_id}/workflow-runs/{run_id}")
+        if not isinstance(payload, dict):
+            raise ConsoleApiError(f"Unexpected workflow run response: {payload!r}")
+        return payload
+
+    def list_workflow_run_nodes(
+        self, app_id: str, run_id: str
+    ) -> list[dict[str, Any]]:
+        payload = self._request_json(
+            f"/apps/{app_id}/workflow-runs/{run_id}/node-executions",
+            allow_list=True,
+        )
+        if isinstance(payload, list):
+            return payload
+        for key in ("data", "items"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+        raise ConsoleApiError(f"Unexpected node execution response: {payload!r}")
+
     def list_workspaces(self) -> list[dict[str, Any]]:
         payload = self._request_json("/workspaces", allow_list=True)
         if isinstance(payload, list):
@@ -397,11 +457,6 @@ class ConsoleSession:
         )
 
     def export_dsl(self, app_id: str) -> str:
-        if self._last_export_at is not None:
-            delay = EXPORT_INTERVAL_SECONDS - (time.monotonic() - self._last_export_at)
-            if delay > 0:
-                time.sleep(delay)
-        self._last_export_at = time.monotonic()
         payload = self._request_json(f"/apps/{app_id}/export?include_secret=true")
         dsl = payload.get("data")
         if not isinstance(dsl, str) or not dsl:

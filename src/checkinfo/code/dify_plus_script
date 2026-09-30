@@ -1,0 +1,1770 @@
+// ==UserScript==
+// @name         Dify PLUS
+// @namespace    local.dify.workflow
+// @version      1.3.1
+// @description  Dify Plus for CX
+// @author       Maersk china AI Team
+// @match        https://dify-devs.maersk-digital.net/*
+// @match        https://dify-cxprod.maersk-digital.net/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function (root, factory) {
+  'use strict'
+
+  const api = factory()
+  if (typeof module === 'object' && module.exports) module.exports = api
+  else api.boot(root)
+})(typeof unsafeWindow !== 'undefined' ? unsafeWindow : globalThis, function () {
+  'use strict'
+
+  const QUERY_KEY = 'difySubworkflowRun'
+  const TEST_QUERY_KEY = 'difySubworkflowTestRun'
+  const TEST_CURSOR_KEY = 'difySubworkflowTestCursor'
+  const BUTTON_CLASS = 'dify-subworkflow-log-button'
+  const JSON_VIEW_CLASS = 'dify-decoded-json-view'
+  const LOADER_ID = 'dify-subworkflow-loader'
+  const LOADING_CLASS = 'dify-subworkflow-page-loading'
+  const PLUS_BUTTON_ID = 'dify-plus-menu-button'
+  const PLUS_PANEL_ID = 'dify-plus-settings-panel'
+  const SETTINGS_STORAGE_KEY = 'dify-plus:settings:v1'
+  const SCRIPT_VERSION = '1.3.1'
+  // visible-refresh：只拦截切回页面后的刷新草稿；all：拦截工作流页面的全部 visibilitychange 回调。
+  const VISIBILITY_BLOCK_MODE = 'visible-refresh'
+  const DEBUG = false
+  const CANDIDATE_DETAIL_LIMIT = 8
+  const KEYWORD_RESULT_LIMIT = 20
+  const NEARBY_RESULT_LIMIT = 100
+  const DEFAULT_SETTINGS = Object.freeze({
+    enabled: true,
+    visibilityGuard: true,
+    subworkflowJump: true,
+    jsonParsedView: true,
+    jumpLoading: true,
+  })
+  const SETTINGS_DEFINITIONS = Object.freeze([
+    { key: 'enabled', name: '启用 Dify PLUS', description: '控制下方所有增强功能' },
+    { key: 'visibilityGuard', name: '阻止切回刷新', description: '切回 Workflow 编辑器时不重新拉取草稿' },
+    { key: 'subworkflowJump', name: '子流程日志直达', description: '在子 Workflow 节点右侧显示跳转按钮' },
+    { key: 'jsonParsedView', name: 'JSON 解析视图', description: '提供嵌套 JSON 还原、着色和复制' },
+    { key: 'jumpLoading', name: '跳转加载动画', description: '定位和打开子流程日志时显示加载状态' },
+  ])
+  const UUID_PATTERN = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}'
+  const UUID_RE = new RegExp(`^${UUID_PATTERN}$`)
+  const RUN_API_RE = new RegExp(`/apps/(${UUID_PATTERN})/workflow-runs/(${UUID_PATTERN})(/node-executions)?(?:\\?|$)`)
+  const RUN_LIST_API_RE = new RegExp(`/apps/(${UUID_PATTERN})/workflow-runs(?:\\?|$)`)
+  const LOG_API_RE = new RegExp(`/apps/(${UUID_PATTERN})/workflow-app-logs(?:\\?|$)`)
+  const APP_PATH_RE = new RegExp(`^(.*?)/app/(${UUID_PATTERN})/(?:logs|workflow)(?:/|$)`)
+
+  const state = {
+    rawFetch: null,
+    apiRoot: '',
+    authHeaders: {},
+    runs: new Map(),
+    activeRunKey: '',
+    workflowTools: null,
+    workflowToolsPromise: null,
+    runDetailPromises: new Map(),
+    childLocationPromises: new Map(),
+    destinationResponseReady: false,
+    destinationTestRunIndex: -1,
+    destinationTestHistoryOpened: false,
+    destinationOpenedKey: '',
+    decodedEditors: new Map(),
+    observer: null,
+    scanTimer: 0,
+    destinationLoaderTimer: 0,
+    settings: null,
+    settingsPanelOpen: false,
+  }
+
+  function loadSettings(win) {
+    if (state.settings) return state.settings
+    let saved = {}
+    try {
+      saved = JSON.parse(win.localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}')
+    } catch {}
+    state.settings = { ...DEFAULT_SETTINGS, ...(saved && typeof saved === 'object' ? saved : {}) }
+    return state.settings
+  }
+
+  function featureEnabled(win, key) {
+    const settings = loadSettings(win)
+    return settings.enabled && settings[key] !== false
+  }
+
+  function saveSettings(win, patch) {
+    state.settings = { ...loadSettings(win), ...patch }
+    try {
+      win.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(state.settings))
+    } catch {}
+    applySettings(win)
+    return state.settings
+  }
+
+  function parseMaybeJson(value) {
+    if (typeof value !== 'string') return value
+    const trimmed = value.trim()
+    if (!trimmed || !['{', '['].includes(trimmed[0])) return value
+    try {
+      return JSON.parse(trimmed)
+    } catch {
+      return value
+    }
+  }
+
+  function decodeNestedJson(value, depth = 0, seen = new WeakSet()) {
+    if (depth > 12) return value
+    if (typeof value === 'string') {
+      if (value.length > 2000000) return value
+      let decoded = value
+      for (let count = 0; count < 5; count++) {
+        if (typeof decoded !== 'string') break
+        const trimmed = decoded.trim()
+        if (!trimmed || !['{', '['].includes(trimmed[0])) break
+        try {
+          const parsed = JSON.parse(trimmed)
+          if (!parsed || typeof parsed !== 'object') break
+          decoded = parsed
+        } catch {
+          break
+        }
+      }
+      return decoded === value ? value : decodeNestedJson(decoded, depth + 1, seen)
+    }
+    if (!value || typeof value !== 'object' || seen.has(value)) return value
+    seen.add(value)
+    if (Array.isArray(value)) return value.map(item => decodeNestedJson(item, depth + 1, seen))
+    const decoded = {}
+    for (const [key, item] of Object.entries(value)) decoded[key] = decodeNestedJson(item, depth + 1, seen)
+    return decoded
+  }
+
+  function formatDecodedEditorValue(value) {
+    if (value === null || value === undefined) return ''
+    let parsed = value
+    if (typeof value === 'string') {
+      try {
+        parsed = JSON.parse(value)
+      } catch {
+        parsed = parseMaybeJson(value)
+      }
+    }
+    const decoded = decodeNestedJson(parsed)
+    if (typeof decoded === 'string') return decoded
+    try {
+      return JSON.stringify(decoded, null, 2)
+    } catch {
+      return String(value)
+    }
+  }
+
+  function tokenizeJson(text) {
+    const source = String(text || '')
+    const tokens = []
+    const pattern = /"(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}[\],:]/g
+    let cursor = 0
+    let match
+    while ((match = pattern.exec(source))) {
+      if (match.index > cursor) tokens.push({ type: 'plain', text: source.slice(cursor, match.index) })
+      const token = match[0]
+      let type = 'punctuation'
+      if (token[0] === '"') type = /^\s*:/.test(source.slice(pattern.lastIndex)) ? 'key' : 'string'
+      else if (/^-?\d/.test(token)) type = 'number'
+      else if (token === 'true' || token === 'false') type = 'boolean'
+      else if (token === 'null') type = 'null'
+      tokens.push({ type, text: token })
+      cursor = pattern.lastIndex
+    }
+    if (cursor < source.length) tokens.push({ type: 'plain', text: source.slice(cursor) })
+    return tokens
+  }
+
+  function renderHighlightedJson(doc, element, text) {
+    const fragment = doc.createDocumentFragment()
+    for (const token of tokenizeJson(text)) {
+      if (token.type === 'plain') fragment.appendChild(doc.createTextNode(token.text))
+      else {
+        const span = doc.createElement('span')
+        span.className = `dify-json-${token.type}`
+        span.textContent = token.text
+        fragment.appendChild(span)
+      }
+    }
+    element.replaceChildren(fragment)
+  }
+
+  function decodeRunPayload(payload, nodeExecutions) {
+    const decodeFields = item => {
+      if (!item || typeof item !== 'object') return item
+      const decoded = { ...item }
+      for (const key of ['inputs', 'process_data', 'outputs']) {
+        if (Object.prototype.hasOwnProperty.call(decoded, key)) decoded[key] = decodeNestedJson(decoded[key])
+      }
+      return decoded
+    }
+    if (!nodeExecutions) return decodeFields(payload)
+    if (Array.isArray(payload)) return payload.map(decodeFields)
+    if (payload && Array.isArray(payload.data)) return { ...payload, data: payload.data.map(decodeFields) }
+    return payload
+  }
+
+  function asList(payload) {
+    if (Array.isArray(payload)) return payload
+    if (payload && Array.isArray(payload.data)) return payload.data
+    if (payload && Array.isArray(payload.items)) return payload.items
+    return []
+  }
+
+  function parseAppPath(pathname) {
+    const match = String(pathname || '').match(APP_PATH_RE)
+    return match ? { basePath: match[1] || '', appId: match[2] } : null
+  }
+
+  function parseRunApi(url) {
+    let parsed
+    try {
+      parsed = new URL(String(url), 'https://placeholder.invalid')
+    } catch {
+      return null
+    }
+    const match = parsed.pathname.match(RUN_API_RE)
+    if (!match) return null
+    const marker = `/apps/${match[1]}/workflow-runs/${match[2]}`
+    return {
+      appId: match[1],
+      runId: match[2],
+      nodeExecutions: Boolean(match[3]),
+      apiRoot: parsed.pathname.slice(0, parsed.pathname.indexOf(marker)),
+    }
+  }
+
+  function parseRunListApi(url) {
+    let parsed
+    try {
+      parsed = new URL(String(url), 'https://placeholder.invalid')
+    } catch {
+      return null
+    }
+    const match = parsed.pathname.match(RUN_LIST_API_RE)
+    if (!match) return null
+    const marker = `/apps/${match[1]}/workflow-runs`
+    return {
+      appId: match[1],
+      apiRoot: parsed.pathname.slice(0, parsed.pathname.indexOf(marker)),
+    }
+  }
+
+  function parseLogApi(url) {
+    let parsed
+    try {
+      parsed = new URL(String(url), 'https://placeholder.invalid')
+    } catch {
+      return null
+    }
+    const match = parsed.pathname.match(LOG_API_RE)
+    if (!match) return null
+    const marker = `/apps/${match[1]}/workflow-app-logs`
+    return {
+      appId: match[1],
+      apiRoot: parsed.pathname.slice(0, parsed.pathname.indexOf(marker)),
+    }
+  }
+
+  function destinationFromLocation(locationLike) {
+    const page = parseAppPath(locationLike.pathname)
+    const runId = new URLSearchParams(locationLike.search || '').get(QUERY_KEY)
+    if (!page || !runId || !UUID_RE.test(runId)) return null
+    return { ...page, runId, key: `${page.appId}:${runId}` }
+  }
+
+  function testDestinationFromLocation(locationLike) {
+    const page = parseAppPath(locationLike.pathname)
+    const params = new URLSearchParams(locationLike.search || '')
+    const runId = params.get(TEST_QUERY_KEY)
+    const cursor = params.get(TEST_CURSOR_KEY)
+    if (!page || !runId || !UUID_RE.test(runId) || !/\/workflow(?:\/|$)/.test(locationLike.pathname)) return null
+    return { ...page, runId, cursor: cursor && UUID_RE.test(cursor) ? cursor : '', key: `test:${page.appId}:${runId}` }
+  }
+
+  function anyDestinationFromLocation(locationLike) {
+    return destinationFromLocation(locationLike) || testDestinationFromLocation(locationLike)
+  }
+
+  function rewriteDestinationLogUrl(url, locationLike) {
+    const target = destinationFromLocation(locationLike)
+    if (!target) return String(url)
+    let parsed
+    try {
+      parsed = new URL(String(url), locationLike.origin)
+    } catch {
+      return String(url)
+    }
+    const request = parseLogApi(parsed.href)
+    if (!request || request.appId !== target.appId || parsed.origin !== locationLike.origin) return String(url)
+
+    parsed.searchParams.set('keyword', target.runId)
+    parsed.searchParams.set('page', '1')
+    parsed.searchParams.set('limit', '20')
+    parsed.searchParams.set('detail', 'true')
+    parsed.searchParams.delete('status')
+    parsed.searchParams.delete('created_at__after')
+    parsed.searchParams.delete('created_at__before')
+    return parsed.href
+  }
+
+  function rewriteDestinationTestRunUrl(url, locationLike) {
+    const target = testDestinationFromLocation(locationLike)
+    if (!target) return String(url)
+    let parsed
+    try {
+      parsed = new URL(String(url), locationLike.origin)
+    } catch {
+      return String(url)
+    }
+    const request = parseRunListApi(parsed.href)
+    if (!request || request.appId !== target.appId || parsed.origin !== locationLike.origin) return String(url)
+
+    parsed.searchParams.set('limit', '100')
+    parsed.searchParams.set('triggered_from', 'debugging')
+    if (target.cursor) parsed.searchParams.set('last_id', target.cursor)
+    else parsed.searchParams.delete('last_id')
+    parsed.searchParams.delete('status')
+    return parsed.href
+  }
+
+  function rewriteDestinationUrl(url, locationLike) {
+    return rewriteDestinationTestRunUrl(rewriteDestinationLogUrl(url, locationLike), locationLike)
+  }
+
+  function isWorkflowToolGraphNode(node) {
+    const data = node && node.data
+    return Boolean(
+      data &&
+        String(data.type || '').toLowerCase() === 'tool' &&
+        String(data.provider_type || data.providerType || '').toLowerCase() === 'workflow',
+    )
+  }
+
+  function findGraphNode(runDetail, nodeId) {
+    const nodes = runDetail && runDetail.graph && runDetail.graph.nodes
+    return Array.isArray(nodes) ? nodes.find(node => String(node.id) === String(nodeId)) || null : null
+  }
+
+  function resolveChildAppId(providers, graphNode) {
+    if (!graphNode || !graphNode.data) return null
+    const providerId = String(graphNode.data.provider_id || graphNode.data.providerId || '')
+    const toolName = String(graphNode.data.tool_name || graphNode.data.toolName || '')
+    const rows = asList(providers)
+    const provider = rows.find(item => {
+      if (!item) return false
+      const idMatch = [item.id, item.provider_id, item.name].some(value => String(value || '') === providerId)
+      if (!idMatch) return false
+      if (!toolName || !Array.isArray(item.tools) || item.tools.length === 0) return true
+      return item.tools.some(tool => [tool.name, tool.id].some(value => String(value || '') === toolName))
+    })
+    return provider && (provider.workflow_app_id || provider.workflowAppId || provider.app_id) || null
+  }
+
+  function normalizedScalar(value) {
+    if (value === null || value === undefined) return ''
+    if (typeof value === 'string') return value.trim().replace(/\s+/g, ' ').toLocaleLowerCase()
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    return ''
+  }
+
+  function flattenComparable(value, path = [], output = []) {
+    value = parseMaybeJson(value)
+    if (output.length >= 100) return output
+    if (value === null || value === undefined) return output
+    if (typeof value !== 'object') {
+      const scalar = normalizedScalar(value)
+      const key = String(path[path.length - 1] || '').toLocaleLowerCase()
+      if (scalar && !key.startsWith('sys.') && !['files', 'file', 'timestamp'].includes(key))
+        output.push({ key, path: path.join('.').toLocaleLowerCase(), value: scalar })
+      return output
+    }
+    if (Array.isArray(value)) {
+      value.slice(0, 30).forEach((item, index) => flattenComparable(item, [...path, String(index)], output))
+      return output
+    }
+    Object.entries(value).forEach(([key, item]) => {
+      const lower = key.toLocaleLowerCase()
+      if (lower.startsWith('sys.') || ['files', 'file', '__dify__'].includes(lower)) return
+      flattenComparable(item, [...path, key], output)
+    })
+    return output
+  }
+
+  function selectLogSearchKeyword(inputs) {
+    const ignored = new Set([
+      'true', 'false', 'null', 'none', 'unknown', 'succeeded', 'failed', 'running', 'stopped',
+    ])
+    const candidates = flattenComparable(inputs)
+      .map(item => {
+        const value = item.value
+        if (value.length < 4 || value.length > 30 || ignored.has(value)) return null
+        if (/^https?:\/\//.test(value) || /\s{2,}/.test(value)) return null
+
+        const signal = `${item.path}.${item.key}`.replace(/[^a-z0-9]/g, '')
+        let score = 0
+        if (/case(?:number|no|id)/.test(signal)) score += 140
+        else if (/(?:ticket|request|booking|shipment|container)(?:number|no|id)/.test(signal)) score += 120
+        else if (/(?:case|ticket|booking|shipment|container)$/.test(signal)) score += 90
+        else if (/(?:number|no|id)$/.test(signal)) score += 55
+        if (UUID_RE.test(value)) score += 70
+        if (/\d/.test(value)) score += 18
+        if (/^[a-z0-9][a-z0-9._\/-]*$/.test(value)) score += 14
+        if (value.length >= 6 && value.length <= 24) score += 8
+        if (value.includes('@')) score -= 25
+        return { value, score }
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.score - left.score || left.value.length - right.value.length)
+    return candidates.length && candidates[0].score >= 35 ? candidates[0].value : ''
+  }
+
+  function prefilterCandidateLogs(nodeExecution, logs, limit = CANDIDATE_DETAIL_LIMIT) {
+    const nodeStart = toEpochSeconds(nodeExecution && nodeExecution.created_at)
+    const nodeDuration = Number(nodeExecution && nodeExecution.elapsed_time) || 0
+    return asList(logs)
+      .map(log => {
+        const run = log && log.workflow_run
+        if (!run || !UUID_RE.test(String(run.id))) return null
+        const startDelta = nodeStart ? Math.abs(toEpochSeconds(run.created_at) - nodeStart) : 999999
+        const durationDelta = nodeDuration
+          ? Math.abs((Number(run.elapsed_time) || 0) - nodeDuration)
+          : 999999
+        return { log, startDelta, durationDelta }
+      })
+      .filter(Boolean)
+      .sort((left, right) =>
+        left.startDelta - right.startDelta ||
+        left.durationDelta - right.durationDelta ||
+        toEpochSeconds(right.log.workflow_run.created_at) - toEpochSeconds(left.log.workflow_run.created_at),
+      )
+      .slice(0, Math.max(1, limit))
+      .map(item => item.log)
+  }
+
+  function inputsContainKeyword(inputs, keyword) {
+    const needle = normalizedScalar(keyword)
+    return Boolean(needle && flattenComparable(inputs).some(item =>
+      item.value === needle || (needle.length >= 8 && item.value.includes(needle)),
+    ))
+  }
+
+  function inputSimilarity(parentInputs, childInputs) {
+    const parent = flattenComparable(parentInputs)
+    const child = flattenComparable(childInputs)
+    if (!parent.length || !child.length) return { score: 0, comparable: parent.length }
+
+    let matched = 0
+    let total = 0
+    for (const left of parent) {
+      const weight = Math.min(Math.max(left.value.length, 2), 40)
+      total += weight
+      const sameKey = child.some(right => right.key === left.key && right.value === left.value)
+      const sameValue = child.some(right => right.value === left.value)
+      const contained = left.value.length >= 8 && child.some(right =>
+        right.value.includes(left.value) || left.value.includes(right.value),
+      )
+      if (sameKey) matched += weight
+      else if (sameValue) matched += weight * 0.9
+      else if (contained) matched += weight * 0.55
+    }
+    return { score: total ? matched / total : 0, comparable: parent.length }
+  }
+
+  function toEpochSeconds(value) {
+    const number = Number(value)
+    if (Number.isFinite(number)) return number > 100000000000 ? number / 1000 : number
+    const parsed = Date.parse(String(value || ''))
+    return Number.isFinite(parsed) ? parsed / 1000 : 0
+  }
+
+  function rankCandidates(nodeExecution, candidateDetails) {
+    const nodeStart = toEpochSeconds(nodeExecution && nodeExecution.created_at)
+    const nodeDuration = Number(nodeExecution && nodeExecution.elapsed_time) || 0
+    return candidateDetails
+      .filter(Boolean)
+      .map(detail => {
+        const similarity = inputSimilarity(nodeExecution && nodeExecution.inputs, detail.inputs)
+        const startDelta = nodeStart ? Math.abs(toEpochSeconds(detail.created_at) - nodeStart) : 999999
+        const durationDelta = nodeDuration
+          ? Math.abs((Number(detail.elapsed_time) || 0) - nodeDuration)
+          : 999999
+        return {
+          detail,
+          inputScore: similarity.score,
+          comparableInputs: similarity.comparable,
+          startDelta,
+          durationDelta,
+          score: similarity.score * 10000 - Math.min(startDelta, 300) * 20 - Math.min(durationDelta, 300) * 3,
+        }
+      })
+      .sort((a, b) => b.score - a.score)
+  }
+
+  function candidatesAreAmbiguous(ranked) {
+    if (ranked.length < 2) return false
+    const [first, second] = ranked
+    if (first.comparableInputs && first.inputScore < 0.35) return true
+    return (
+      Math.abs(first.inputScore - second.inputScore) < 0.03 &&
+      Math.abs(first.startDelta - second.startDelta) < 1 &&
+      Math.abs(first.durationDelta - second.durationDelta) < 1
+    )
+  }
+
+  function runSourceFromPath(pathname) {
+    const path = String(pathname || '')
+    if (/\/app\/[0-9a-fA-F-]+\/workflow(?:\/|$)/.test(path)) return 'debugging'
+    return 'logs'
+  }
+
+  function runSourceForContext(pathname, context) {
+    const triggeredFrom = context && context.runDetail && context.runDetail.triggered_from
+    if (triggeredFrom) return triggeredFrom === 'debugging' ? 'debugging' : 'logs'
+    return runSourceFromPath(pathname)
+  }
+
+  function runDetailMatchesSource(detail, source) {
+    if (!detail) return false
+    // 当前 Dify 的 WorkflowRunDetailResponse 不包含 triggered_from。
+    // 来源隔离由列表接口完成；仅在旧版/定制版确实返回该字段时做额外校验。
+    const triggeredFrom = detail.triggered_from
+    if (!triggeredFrom) return true
+    return source === 'debugging' ? triggeredFrom === 'debugging' : triggeredFrom !== 'debugging'
+  }
+
+  function debugRunsInTimeWindow(nodeExecution, runs, secondsPadding = 180) {
+    const created = toEpochSeconds(nodeExecution && nodeExecution.created_at)
+    const finished = toEpochSeconds(nodeExecution && nodeExecution.finished_at) ||
+      created + (Number(nodeExecution && nodeExecution.elapsed_time) || 0)
+    return asList(runs)
+      .filter(run => {
+        if (!run || !UUID_RE.test(String(run.id))) return false
+        if (run.triggered_from && run.triggered_from !== 'debugging') return false
+        if (!created) return true
+        const timestamp = toEpochSeconds(run.created_at)
+        return timestamp >= created - secondsPadding && timestamp <= finished + secondsPadding
+      })
+      .map(workflow_run => ({ workflow_run }))
+  }
+
+  function buildChildLogUrl(origin, basePath, appId, runId) {
+    if (!UUID_RE.test(String(appId)) || !UUID_RE.test(String(runId))) throw new Error('无效的应用或运行 ID')
+    const prefix = String(basePath || '').replace(/\/$/, '')
+    const target = new URL(`${prefix}/app/${appId}/logs`, origin)
+    target.searchParams.set(QUERY_KEY, runId)
+    return target.href
+  }
+
+  function buildChildTestRunUrl(origin, basePath, appId, runId, cursor = '') {
+    if (!UUID_RE.test(String(appId)) || !UUID_RE.test(String(runId))) throw new Error('无效的应用或运行 ID')
+    const prefix = String(basePath || '').replace(/\/$/, '')
+    const target = new URL(`${prefix}/app/${appId}/workflow`, origin)
+    target.searchParams.set(TEST_QUERY_KEY, runId)
+    if (cursor && UUID_RE.test(String(cursor))) target.searchParams.set(TEST_CURSOR_KEY, cursor)
+    return target.href
+  }
+
+  function deepFindRunId(value, parentRunId, depth = 0, seen = new Set()) {
+    value = parseMaybeJson(value)
+    if (!value || typeof value !== 'object' || depth > 7 || seen.has(value)) return null
+    seen.add(value)
+    for (const [key, item] of Object.entries(value)) {
+      const lower = key.toLocaleLowerCase()
+      if (
+        ['child_workflow_run_id', 'sub_workflow_run_id', 'workflow_run_id', 'run_id'].includes(lower) &&
+        typeof item === 'string' && UUID_RE.test(item) && item !== parentRunId
+      ) return item
+    }
+    for (const item of Object.values(value)) {
+      const found = deepFindRunId(item, parentRunId, depth + 1, seen)
+      if (found) return found
+    }
+    return null
+  }
+
+  function boot(win) {
+    if (!win || !win.document || !/^dify-(?:devs|cxprod)\.maersk-digital\.net$/i.test(win.location.hostname)) return
+    if (win.__DIFY_PLUS_INSTALLED__) return
+    win.__DIFY_PLUS_INSTALLED__ = true
+    loadSettings(win)
+    installVisibilityRefreshGuard(win)
+    patchNetwork(win)
+    installStyles(win.document)
+    if (featureEnabled(win, 'subworkflowJump') && featureEnabled(win, 'jumpLoading'))
+      activateDestinationLoader(win)
+    patchHistory(win)
+    startObserver(win)
+    win.addEventListener('resize', () => scheduleScan(win), { passive: true })
+    win.document.addEventListener('scroll', () => scheduleScan(win), { passive: true, capture: true })
+    win.addEventListener('storage', event => {
+      if (event.key !== SETTINGS_STORAGE_KEY) return
+      state.settings = null
+      applySettings(win)
+    })
+    scheduleScan(win)
+  }
+
+  function isDifyWorkflowEditor(locationLike) {
+    const path = String(locationLike && locationLike.pathname || '')
+    return (
+      /\/app\/[^/]+\/workflow(?:\/|$)/.test(path) ||
+      /\/app\/[^/]+\/orchestrate(?:\/|$)/.test(path) ||
+      /\/apps\/[^/]+\/workflow(?:\/|$)/.test(path) ||
+      path.includes('/workflow')
+    )
+  }
+
+  function installVisibilityRefreshGuard(win) {
+    if (win.__DIFY_PLUS_VISIBILITY_GUARD__ || win.DIFY_DISABLE_VISIBILITY_REFRESH) return
+    win.__DIFY_PLUS_VISIBILITY_GUARD__ = true
+    // 与旧版独立脚本共用该标记，避免重复包装 visibilitychange。
+    win.DIFY_DISABLE_VISIBILITY_REFRESH = true
+
+    const eventTargetPrototype = win.EventTarget && win.EventTarget.prototype
+    if (!eventTargetPrototype) return
+    const originalAddEventListener = eventTargetPrototype.addEventListener
+    const originalRemoveEventListener = eventTargetPrototype.removeEventListener
+    const wrappedListeners = new WeakMap()
+
+    const captureValue = options => typeof options === 'boolean' ? options : Boolean(options && options.capture)
+    const shouldBlock = () => {
+      if (!featureEnabled(win, 'visibilityGuard')) return false
+      if (!isDifyWorkflowEditor(win.location)) return false
+      if (VISIBILITY_BLOCK_MODE === 'all') return true
+      return win.document.visibilityState === 'visible'
+    }
+    const wrapperFor = (listener, options) => {
+      let wrappersByCapture = wrappedListeners.get(listener)
+      if (!wrappersByCapture) {
+        wrappersByCapture = new Map()
+        wrappedListeners.set(listener, wrappersByCapture)
+      }
+      const capture = captureValue(options)
+      if (wrappersByCapture.has(capture)) return wrappersByCapture.get(capture)
+      const wrapped = function (event) {
+        if (shouldBlock()) {
+          if (DEBUG)
+            win.console.debug('[Dify PLUS] blocked visibilitychange:', win.document.visibilityState, win.location.href)
+          return
+        }
+        if (typeof listener === 'function') return listener.call(this, event)
+        if (listener && typeof listener.handleEvent === 'function') return listener.handleEvent(event)
+      }
+      wrappersByCapture.set(capture, wrapped)
+      return wrapped
+    }
+
+    eventTargetPrototype.addEventListener = function (type, listener, options) {
+      if (this === win.document && type === 'visibilitychange' && listener)
+        return originalAddEventListener.call(this, type, wrapperFor(listener, options), options)
+      return originalAddEventListener.call(this, type, listener, options)
+    }
+
+    eventTargetPrototype.removeEventListener = function (type, listener, options) {
+      if (this === win.document && type === 'visibilitychange' && listener) {
+        const wrappersByCapture = wrappedListeners.get(listener)
+        const wrapped = wrappersByCapture && wrappersByCapture.get(captureValue(options))
+        return originalRemoveEventListener.call(this, type, wrapped || listener, options)
+      }
+      return originalRemoveEventListener.call(this, type, listener, options)
+    }
+
+    if (DEBUG) win.console.debug('[Dify PLUS] visibility refresh guard installed')
+  }
+
+  function installStyles(doc) {
+    if (doc.getElementById('dify-subworkflow-log-styles')) return
+    if (!doc.head && !doc.documentElement) {
+      doc.addEventListener('DOMContentLoaded', () => installStyles(doc), { once: true })
+      return
+    }
+    const style = doc.createElement('style')
+    style.id = 'dify-subworkflow-log-styles'
+    style.textContent = `
+      .${BUTTON_CLASS}{display:inline-flex;align-items:center;gap:4px;flex:none;margin-left:8px;padding:3px 7px;border:1px solid #84adff;border-radius:6px;background:#eff4ff;color:#155eef;font:600 11px/16px system-ui;cursor:pointer;white-space:nowrap;z-index:2}
+      .${BUTTON_CLASS}:hover{background:#d1e0ff}.dify-subworkflow-log-button:disabled{cursor:wait;opacity:.7}
+      #${PLUS_BUTTON_ID}{display:inline-flex;height:32px;flex:none;align-items:center;gap:6px;padding:0 10px;border:1px solid rgba(21,94,239,.28);border-radius:8px;background:#f5f8ff;color:#155eef;box-shadow:0 1px 2px rgba(16,24,40,.05);font:650 12px/18px system-ui;letter-spacing:.02em;cursor:pointer;white-space:nowrap}#${PLUS_BUTTON_ID}.dify-plus-portal{position:fixed;z-index:31}
+      #${PLUS_BUTTON_ID}:hover,#${PLUS_BUTTON_ID}[aria-expanded="true"]{border-color:#84adff;background:#eaf0ff}#${PLUS_BUTTON_ID}:focus-visible{outline:2px solid #84adff;outline-offset:2px}
+      .dify-plus-status-dot{width:7px;height:7px;border-radius:50%;background:#17b26a;box-shadow:0 0 0 2px rgba(23,178,106,.14)}#${PLUS_BUTTON_ID}.dify-plus-disabled .dify-plus-status-dot{background:#98a2b3;box-shadow:none}
+      #${PLUS_PANEL_ID}{position:fixed;z-index:2147483646;width:330px;padding:8px;border:1px solid rgba(16,24,40,.10);border-radius:12px;background:#fff;color:#344054;box-shadow:0 16px 48px rgba(16,24,40,.20);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+      .dify-plus-panel-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px 10px}.dify-plus-panel-title{color:#101828;font-size:14px;font-weight:700;line-height:20px}.dify-plus-panel-version{color:#98a2b3;font-size:11px}
+      .dify-plus-setting{display:flex;min-height:52px;align-items:center;gap:12px;padding:8px 10px;border-radius:8px;cursor:pointer}.dify-plus-setting:hover{background:#f9fafb}.dify-plus-setting-disabled{opacity:.48}
+      .dify-plus-setting-copy{min-width:0;flex:1}.dify-plus-setting-name{display:block;color:#344054;font-size:13px;font-weight:600;line-height:18px}.dify-plus-setting-description{display:block;margin-top:1px;color:#667085;font-size:11px;line-height:16px}
+      .dify-plus-switch-input{position:absolute;width:1px;height:1px;overflow:hidden;opacity:0}.dify-plus-switch{position:relative;width:36px;height:20px;flex:none;border-radius:999px;background:#d0d5dd;transition:background .16s ease}.dify-plus-switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(16,24,40,.25);transition:transform .16s ease}.dify-plus-switch-input:checked+.dify-plus-switch{background:#155eef}.dify-plus-switch-input:checked+.dify-plus-switch::after{transform:translateX(16px)}.dify-plus-switch-input:focus-visible+.dify-plus-switch{outline:2px solid #84adff;outline-offset:2px}
+      .dify-plus-panel-divider{height:1px;margin:4px 10px;background:#eaecf0}.dify-plus-panel-footer{display:flex;align-items:center;justify-content:space-between;padding:8px 10px 6px;color:#98a2b3;font-size:11px}.dify-plus-reset{padding:3px 6px;border:0;border-radius:5px;background:transparent;color:#475467;font:500 11px/16px system-ui;cursor:pointer}.dify-plus-reset:hover{background:#f2f4f7;color:#155eef}
+      html.dark #${PLUS_BUTTON_ID}{border-color:rgba(132,173,255,.32);background:#182230;color:#84adff}html.dark #${PLUS_BUTTON_ID}:hover,html.dark #${PLUS_BUTTON_ID}[aria-expanded="true"]{background:#1d2939}
+      html.dark #${PLUS_PANEL_ID}{border-color:rgba(255,255,255,.10);background:#1d2939;color:#d0d5dd;box-shadow:0 16px 48px rgba(0,0,0,.42)}html.dark .dify-plus-panel-title{color:#f2f4f7}html.dark .dify-plus-setting:hover{background:#344054}html.dark .dify-plus-setting-name{color:#e4e7ec}html.dark .dify-plus-setting-description,html.dark .dify-plus-panel-footer{color:#98a2b3}html.dark .dify-plus-panel-divider{background:#344054}html.dark .dify-plus-reset{color:#d0d5dd}html.dark .dify-plus-reset:hover{background:#344054;color:#84adff}
+      html.${LOADING_CLASS}{background:#f2f4f7}
+      #${LOADER_ID}{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:linear-gradient(145deg,#f8fafc 0%,#eef4ff 100%);opacity:1;transition:opacity .22s ease;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+      #${LOADER_ID}.dify-subworkflow-loader-leaving{pointer-events:none;opacity:0}
+      #${LOADER_ID}>div{display:flex;min-width:260px;align-items:center;gap:14px;padding:18px 22px;border:1px solid rgba(16,24,40,.08);border-radius:14px;background:rgba(255,255,255,.94);color:#344054;box-shadow:0 18px 50px rgba(16,24,40,.14)}
+      .dify-subworkflow-spinner{width:22px;height:22px;flex:none;border:3px solid #d1e0ff;border-top-color:#155eef;border-radius:50%;animation:dify-subworkflow-spin .8s linear infinite}
+      .dify-subworkflow-loader-title{font-size:14px;font-weight:650;line-height:20px}.dify-subworkflow-loader-detail{margin-top:2px;color:#667085;font-size:12px;line-height:18px}
+      @keyframes dify-subworkflow-spin{to{transform:rotate(360deg)}}
+      @media (prefers-reduced-motion:reduce){.dify-subworkflow-spinner{animation-duration:1.8s}#${LOADER_ID}{transition:none}}
+      #dify-subworkflow-toast{position:fixed;right:20px;bottom:20px;z-index:2147483647;max-width:440px;padding:10px 14px;border:1px solid rgba(16,24,40,.12);border-radius:8px;background:#fff;color:#344054;box-shadow:0 8px 24px rgba(16,24,40,.18);font:13px/20px system-ui}
+      #dify-subworkflow-picker{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;justify-content:center;background:rgba(16,24,40,.36);font:13px/20px system-ui}
+      #dify-subworkflow-picker>div{width:min(620px,calc(100vw - 32px));max-height:70vh;overflow:auto;border-radius:12px;background:#fff;padding:18px;box-shadow:0 16px 48px rgba(16,24,40,.28)}
+      #dify-subworkflow-picker h2{margin:0 0 6px;font-size:16px;color:#101828}#dify-subworkflow-picker p{margin:0 0 12px;color:#667085}
+      #dify-subworkflow-picker button{width:100%;margin:5px 0;padding:9px 10px;text-align:left;border:1px solid #d0d5dd;border-radius:8px;background:#fff;color:#344054;cursor:pointer}
+      #dify-subworkflow-picker button:hover{border-color:#84adff;background:#f5f8ff}.dify-picker-close{margin-top:12px!important;text-align:center!important}
+      .dify-json-action{margin-left:4px;padding:2px 6px;border:1px solid #d0d5dd;border-radius:5px;background:#fff;color:#475467;font:500 11px/16px system-ui;cursor:pointer}
+      .dify-json-action:hover{border-color:#84adff;background:#f5f8ff;color:#155eef}
+      .${JSON_VIEW_CLASS}{box-sizing:border-box;max-height:420px;min-height:48px;margin:0 8px 8px;padding:10px 12px;overflow:auto;border:1px solid rgba(16,24,40,.08);border-radius:6px;background:#f9fafb;color:#344054;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:2;font:12px/18px ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;user-select:text}
+      html.dark .${JSON_VIEW_CLASS}{border-color:rgba(255,255,255,.10);background:#182230;color:#e4e7ec}
+      .dify-json-key{color:#175cd3;font-weight:600}.dify-json-string{color:#067647}.dify-json-number{color:#b54708}.dify-json-boolean{color:#7a5af8;font-weight:600}.dify-json-null{color:#667085;font-style:italic}.dify-json-punctuation{color:#475467}
+      html.dark .dify-json-key{color:#84adff}html.dark .dify-json-string{color:#75e0a7}html.dark .dify-json-number{color:#fec84b}html.dark .dify-json-boolean{color:#bdb4fe}html.dark .dify-json-null{color:#98a2b3}html.dark .dify-json-punctuation{color:#d0d5dd}
+    `
+    ;(doc.head || doc.documentElement).appendChild(style)
+  }
+
+  function isVisibleElement(win, element) {
+    if (!element || !element.isConnected) return false
+    const rect = element.getBoundingClientRect()
+    if (rect.width < 8 || rect.height < 8) return false
+    const style = win.getComputedStyle(element)
+    return style.display !== 'none' && style.visibility !== 'hidden'
+  }
+
+  function findPluginsNavButton(win) {
+    const doc = win.document
+    const direct = [...doc.querySelectorAll('.plugins-nav-button')].find(item => isVisibleElement(win, item))
+    if (direct) return direct
+
+    const candidates = new Set()
+    for (const selector of [
+      'a[href="/plugins"]',
+      'a[href$="/plugins"]',
+      'a[href="/marketplace"]',
+      '[aria-label*="plugin" i]',
+      '[title*="plugin" i]',
+    ]) {
+      for (const item of doc.querySelectorAll(selector))
+        candidates.add(item.closest('button, a') || item)
+    }
+    for (const item of doc.querySelectorAll('button, a')) {
+      const text = String(item.textContent || '').trim().toLocaleLowerCase()
+      if (text === '插件' || text === 'plugins' || text === 'plugin') candidates.add(item)
+    }
+
+    const ranked = [...candidates]
+      .filter(item => item.id !== PLUS_BUTTON_ID && isVisibleElement(win, item))
+      .map(item => ({ item, rect: item.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.top < 120 && rect.right > win.innerWidth * 0.45)
+      .sort((left, right) => left.rect.top - right.rect.top || right.rect.right - left.rect.right)
+    return ranked.length ? ranked[0].item : null
+  }
+
+  function syncPlusButton(win) {
+    const button = win.document.getElementById(PLUS_BUTTON_ID)
+    if (!button) return
+    const enabled = loadSettings(win).enabled
+    button.classList.toggle('dify-plus-disabled', !enabled)
+    button.title = enabled ? '打开 Dify PLUS 设置' : 'Dify PLUS 已关闭，点击打开设置'
+  }
+
+  function positionPlusButton(win, button, pluginsButton) {
+    const pluginRect = pluginsButton.getBoundingClientRect()
+    const buttonRect = button.getBoundingClientRect()
+    const buttonWidth = buttonRect.width || 64
+    const buttonHeight = buttonRect.height || 32
+    const left = Math.max(8, pluginRect.left - buttonWidth - 8)
+    const top = Math.max(4, pluginRect.top + (pluginRect.height - buttonHeight) / 2)
+    button.style.left = `${Math.round(left)}px`
+    button.style.top = `${Math.round(top)}px`
+  }
+
+  function findHorizontalInsertionPoint(win, pluginsButton) {
+    let item = pluginsButton
+    let parent = pluginsButton.parentElement
+    for (let depth = 0; parent && depth < 8; depth++) {
+      const style = win.getComputedStyle(parent)
+      const isFlex = style.display === 'flex' || style.display === 'inline-flex'
+      const isRow = !style.flexDirection || style.flexDirection.startsWith('row')
+      if (isFlex && isRow) return { parent, before: item }
+      item = parent
+      parent = parent.parentElement
+    }
+    return null
+  }
+
+  function injectPlusMenuButton(win) {
+    const doc = win.document
+    let button = doc.getElementById(PLUS_BUTTON_ID)
+    const pluginsButton = findPluginsNavButton(win)
+    if (!pluginsButton) {
+      if (button) button.style.display = 'none'
+      return
+    }
+
+    if (!button) {
+      button = doc.createElement('button')
+      button.id = PLUS_BUTTON_ID
+      button.type = 'button'
+      button.setAttribute('aria-haspopup', 'dialog')
+      button.setAttribute('aria-expanded', 'false')
+      const dot = doc.createElement('span')
+      dot.className = 'dify-plus-status-dot'
+      dot.setAttribute('aria-hidden', 'true')
+      const label = doc.createElement('span')
+      label.textContent = 'PLUS'
+      button.append(dot, label)
+      button.addEventListener('click', event => {
+        event.preventDefault()
+        event.stopPropagation()
+        if (doc.getElementById(PLUS_PANEL_ID)) closeSettingsPanel(win)
+        else openSettingsPanel(win, button)
+      })
+    }
+    const insertion = findHorizontalInsertionPoint(win, pluginsButton)
+    if (insertion) {
+      button.classList.remove('dify-plus-portal')
+      button.style.left = ''
+      button.style.top = ''
+      if (button.parentNode !== insertion.parent || button.nextSibling !== insertion.before)
+        insertion.parent.insertBefore(button, insertion.before)
+    } else {
+      button.classList.add('dify-plus-portal')
+      if (button.parentNode !== doc.body) doc.body.appendChild(button)
+      positionPlusButton(win, button, pluginsButton)
+    }
+    button.style.display = 'inline-flex'
+    syncPlusButton(win)
+    const panel = doc.getElementById(PLUS_PANEL_ID)
+    if (panel) positionSettingsPanel(win, panel, button)
+  }
+
+  function closeSettingsPanel(win) {
+    const panel = win.document.getElementById(PLUS_PANEL_ID)
+    if (panel && typeof panel.__difyPlusCleanup === 'function') panel.__difyPlusCleanup()
+    if (panel) panel.remove()
+    const button = win.document.getElementById(PLUS_BUTTON_ID)
+    if (button) button.setAttribute('aria-expanded', 'false')
+    state.settingsPanelOpen = false
+  }
+
+  function positionSettingsPanel(win, panel, anchor) {
+    const anchorRect = anchor.getBoundingClientRect()
+    const panelRect = panel.getBoundingClientRect()
+    const left = Math.max(8, Math.min(anchorRect.right - panelRect.width, win.innerWidth - panelRect.width - 8))
+    const top = Math.max(8, Math.min(anchorRect.bottom + 8, win.innerHeight - panelRect.height - 8))
+    panel.style.left = `${left}px`
+    panel.style.top = `${top}px`
+  }
+
+  function renderSettingsPanel(win, panel) {
+    const doc = win.document
+    const settings = loadSettings(win)
+    panel.replaceChildren()
+
+    const header = doc.createElement('div')
+    header.className = 'dify-plus-panel-header'
+    const title = doc.createElement('div')
+    title.className = 'dify-plus-panel-title'
+    title.textContent = 'Dify PLUS'
+    const version = doc.createElement('div')
+    version.className = 'dify-plus-panel-version'
+    version.textContent = `v${SCRIPT_VERSION}`
+    header.append(title, version)
+    panel.appendChild(header)
+
+    SETTINGS_DEFINITIONS.forEach((definition, index) => {
+      if (index === 1) {
+        const divider = doc.createElement('div')
+        divider.className = 'dify-plus-panel-divider'
+        panel.appendChild(divider)
+      }
+      const row = doc.createElement('label')
+      row.className = 'dify-plus-setting'
+      if (definition.key !== 'enabled' && !settings.enabled) row.classList.add('dify-plus-setting-disabled')
+      const copy = doc.createElement('span')
+      copy.className = 'dify-plus-setting-copy'
+      const name = doc.createElement('span')
+      name.className = 'dify-plus-setting-name'
+      name.textContent = definition.name
+      const description = doc.createElement('span')
+      description.className = 'dify-plus-setting-description'
+      description.textContent = definition.description
+      copy.append(name, description)
+      const input = doc.createElement('input')
+      input.className = 'dify-plus-switch-input'
+      input.type = 'checkbox'
+      input.checked = settings[definition.key] !== false
+      input.disabled = definition.key !== 'enabled' && !settings.enabled
+      input.setAttribute('aria-label', definition.name)
+      const toggle = doc.createElement('span')
+      toggle.className = 'dify-plus-switch'
+      input.addEventListener('change', () => {
+        saveSettings(win, { [definition.key]: input.checked })
+        renderSettingsPanel(win, panel)
+        const anchor = doc.getElementById(PLUS_BUTTON_ID)
+        if (anchor) positionSettingsPanel(win, panel, anchor)
+      })
+      row.append(copy, input, toggle)
+      panel.appendChild(row)
+    })
+
+    const footer = doc.createElement('div')
+    footer.className = 'dify-plus-panel-footer'
+    const hint = doc.createElement('span')
+    hint.textContent = '设置已自动保存在当前环境'
+    const reset = doc.createElement('button')
+    reset.type = 'button'
+    reset.className = 'dify-plus-reset'
+    reset.textContent = '恢复默认'
+    reset.addEventListener('click', () => {
+      saveSettings(win, { ...DEFAULT_SETTINGS })
+      renderSettingsPanel(win, panel)
+      const anchor = doc.getElementById(PLUS_BUTTON_ID)
+      if (anchor) positionSettingsPanel(win, panel, anchor)
+    })
+    footer.append(hint, reset)
+    panel.appendChild(footer)
+  }
+
+  function openSettingsPanel(win, anchor) {
+    closeSettingsPanel(win)
+    const doc = win.document
+    const panel = doc.createElement('div')
+    panel.id = PLUS_PANEL_ID
+    panel.setAttribute('role', 'dialog')
+    panel.setAttribute('aria-label', 'Dify PLUS 功能设置')
+    renderSettingsPanel(win, panel)
+    doc.body.appendChild(panel)
+    positionSettingsPanel(win, panel, anchor)
+    anchor.setAttribute('aria-expanded', 'true')
+    state.settingsPanelOpen = true
+
+    const onOutside = event => {
+      if (!panel.contains(event.target) && !anchor.contains(event.target)) closeSettingsPanel(win)
+    }
+    const onKeydown = event => {
+      if (event.key === 'Escape') {
+        closeSettingsPanel(win)
+        anchor.focus()
+      }
+    }
+    const onResize = () => {
+      if (anchor.isConnected && panel.isConnected) positionSettingsPanel(win, panel, anchor)
+    }
+    panel.__difyPlusCleanup = () => {
+      doc.removeEventListener('pointerdown', onOutside, true)
+      doc.removeEventListener('keydown', onKeydown, true)
+      win.removeEventListener('resize', onResize)
+    }
+    win.setTimeout(() => doc.addEventListener('pointerdown', onOutside, true), 0)
+    doc.addEventListener('keydown', onKeydown, true)
+    win.addEventListener('resize', onResize)
+  }
+
+  function captureHeaders(headersLike) {
+    if (!headersLike) return
+    try {
+      const headers = new Headers(headersLike)
+      for (const name of ['authorization', 'x-csrf-token']) {
+        const value = headers.get(name)
+        if (value) state.authHeaders[name] = value
+      }
+    } catch {}
+  }
+
+  function patchNetwork(win) {
+    state.rawFetch = win.fetch.bind(win)
+    win.fetch = function (input, init) {
+      const originalUrl = input instanceof Request ? input.url : String(input)
+      const rewrittenUrl = featureEnabled(win, 'subworkflowJump')
+        ? rewriteDestinationUrl(originalUrl, win.location)
+        : originalUrl
+      captureHeaders(input instanceof Request ? input.headers : null)
+      captureHeaders(init && init.headers)
+      let nextInput = input
+      if (rewrittenUrl !== originalUrl)
+        nextInput = input instanceof Request ? new Request(rewrittenUrl, input) : rewrittenUrl
+      return state.rawFetch(nextInput, init).then(response => {
+        const responseUrl = response.url || rewrittenUrl
+        inspectResponse(win, responseUrl, response.clone()).catch(() => {})
+        return response
+      })
+    }
+
+    const XHR = win.XMLHttpRequest
+    if (!XHR) return
+    const originalOpen = XHR.prototype.open
+    const originalSetHeader = XHR.prototype.setRequestHeader
+    XHR.prototype.open = function (method, url, ...rest) {
+      const rewritten = featureEnabled(win, 'subworkflowJump')
+        ? rewriteDestinationUrl(url, win.location)
+        : String(url)
+      this.__difySubworkflowUrl = rewritten
+      this.addEventListener('load', () => inspectXhrResponse(win, this), { once: true })
+      return originalOpen.call(this, method, rewritten, ...rest)
+    }
+    XHR.prototype.setRequestHeader = function (name, value) {
+      if (['authorization', 'x-csrf-token'].includes(String(name).toLocaleLowerCase()))
+        state.authHeaders[String(name).toLocaleLowerCase()] = String(value)
+      return originalSetHeader.call(this, name, value)
+    }
+  }
+
+  async function inspectResponse(win, url, response) {
+    if (!response || !response.ok) return
+    if (!parseRunApi(url) && !parseRunListApi(url) && !parseLogApi(url) && !/\/workspaces\/current\/tools\/workflow(?:\?|$)/.test(url)) return
+    try {
+      capturePayload(win, url, await response.json())
+    } catch {}
+  }
+
+  function inspectXhrResponse(win, xhr) {
+    const url = xhr.__difySubworkflowUrl || xhr.responseURL
+    if (xhr.status < 200 || xhr.status >= 300) return
+    try {
+      const payload = xhr.responseType === 'json' ? xhr.response : JSON.parse(xhr.responseText)
+      capturePayload(win, url, payload)
+    } catch {}
+  }
+
+  function capturePayload(win, url, payload) {
+    const runRequest = parseRunApi(url)
+    if (runRequest) {
+      state.apiRoot = runRequest.apiRoot || state.apiRoot
+      const key = `${runRequest.appId}:${runRequest.runId}`
+      const context = state.runs.get(key) || { appId: runRequest.appId, runId: runRequest.runId }
+      if (runRequest.nodeExecutions) context.nodeExecutions = asList(payload)
+      else context.runDetail = payload
+      state.runs.set(key, context)
+      state.activeRunKey = key
+      scheduleScan(win)
+      return
+    }
+    const logRequest = parseLogApi(url)
+    if (logRequest) {
+      state.apiRoot = logRequest.apiRoot || state.apiRoot
+      const target = destinationFromLocation(win.location)
+      if (target && target.appId === logRequest.appId) {
+        state.destinationResponseReady = asList(payload).some(item => item && item.workflow_run && item.workflow_run.id === target.runId)
+        scheduleScan(win)
+      }
+      return
+    }
+    const runListRequest = parseRunListApi(url)
+    if (runListRequest) {
+      state.apiRoot = runListRequest.apiRoot || state.apiRoot
+      const target = testDestinationFromLocation(win.location)
+      if (target && target.appId === runListRequest.appId) {
+        state.destinationTestRunIndex = asList(payload).findIndex(item => item && item.id === target.runId)
+        state.destinationResponseReady = state.destinationTestRunIndex >= 0
+        if (!state.destinationResponseReady) {
+          clearDestinationLoader(win)
+          showToast(win.document, '目标测试运行不在最近 100 条调试历史中', 7000)
+        }
+        scheduleScan(win)
+      }
+      return
+    }
+    if (/\/workspaces\/current\/tools\/workflow(?:\?|$)/.test(url)) state.workflowTools = payload
+  }
+
+  function patchHistory(win) {
+    for (const method of ['pushState', 'replaceState']) {
+      const original = win.history[method]
+      win.history[method] = function (...args) {
+        const result = original.apply(this, args)
+        state.destinationResponseReady = false
+        state.destinationTestRunIndex = -1
+        state.destinationTestHistoryOpened = false
+        state.destinationOpenedKey = ''
+        scheduleScan(win)
+        return result
+      }
+    }
+    win.addEventListener('popstate', () => {
+      state.destinationResponseReady = false
+      state.destinationTestRunIndex = -1
+      state.destinationTestHistoryOpened = false
+      state.destinationOpenedKey = ''
+      scheduleScan(win)
+    })
+  }
+
+  function activateDestinationLoader(win) {
+    if (!anyDestinationFromLocation(win.location)) return
+    const doc = win.document
+    if (!doc.documentElement) {
+      doc.addEventListener('DOMContentLoaded', () => activateDestinationLoader(win), { once: true })
+      return
+    }
+    doc.documentElement.classList.add(LOADING_CLASS)
+
+    const mount = () => {
+      if (!doc.body || !doc.documentElement.classList.contains(LOADING_CLASS) || doc.getElementById(LOADER_ID)) return
+      const loader = doc.createElement('div')
+      loader.id = LOADER_ID
+      loader.setAttribute('role', 'status')
+      loader.setAttribute('aria-live', 'polite')
+      const card = doc.createElement('div')
+      const spinner = doc.createElement('span')
+      spinner.className = 'dify-subworkflow-spinner'
+      spinner.setAttribute('aria-hidden', 'true')
+      const copy = doc.createElement('div')
+      const title = doc.createElement('div')
+      title.className = 'dify-subworkflow-loader-title'
+      title.textContent = testDestinationFromLocation(win.location) ? '正在打开子工作流测试记录' : '正在打开子工作流日志'
+      const detail = doc.createElement('div')
+      detail.className = 'dify-subworkflow-loader-detail'
+      detail.textContent = '正在加载应用并定位对应的运行记录…'
+      copy.append(title, detail)
+      card.append(spinner, copy)
+      loader.appendChild(card)
+      doc.body.appendChild(loader)
+    }
+
+    if (doc.body) mount()
+    else doc.addEventListener('DOMContentLoaded', mount, { once: true })
+    if (state.destinationLoaderTimer) win.clearTimeout(state.destinationLoaderTimer)
+    state.destinationLoaderTimer = win.setTimeout(() => {
+      clearDestinationLoader(win)
+      if (doc.body) showToast(doc, '自动定位等待超时，已保留运行历史供手动查看', 6000)
+    }, 20000)
+  }
+
+  function updateDestinationLoader(doc, detailText) {
+    const detail = doc.querySelector(`#${LOADER_ID} .dify-subworkflow-loader-detail`)
+    if (detail) detail.textContent = detailText
+  }
+
+  function clearDestinationLoader(win, delay = 0) {
+    if (state.destinationLoaderTimer) {
+      win.clearTimeout(state.destinationLoaderTimer)
+      state.destinationLoaderTimer = 0
+    }
+    const finish = () => {
+      const loader = win.document.getElementById(LOADER_ID)
+      win.document.documentElement.classList.remove(LOADING_CLASS)
+      if (!loader) return
+      loader.classList.add('dify-subworkflow-loader-leaving')
+      win.setTimeout(() => loader.remove(), 240)
+    }
+    if (delay) win.setTimeout(finish, delay)
+    else finish()
+  }
+
+  function renderPendingWindow(pending) {
+    if (!pending || pending.closed) return
+    try {
+      const doc = pending.document
+      doc.open()
+      doc.write(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>正在打开子工作流日志…</title><style>
+        *{box-sizing:border-box}html,body{height:100%;margin:0}body{display:flex;align-items:center;justify-content:center;background:linear-gradient(145deg,#f8fafc 0%,#eef4ff 100%);color:#344054;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+        main{display:flex;min-width:280px;align-items:center;gap:14px;padding:19px 23px;border:1px solid rgba(16,24,40,.08);border-radius:14px;background:rgba(255,255,255,.94);box-shadow:0 18px 50px rgba(16,24,40,.14)}
+        i{display:block;width:24px;height:24px;flex:none;border:3px solid #d1e0ff;border-top-color:#155eef;border-radius:50%;animation:spin .8s linear infinite}strong{display:block;font-size:14px;line-height:20px}small{display:block;margin-top:3px;color:#667085;font-size:12px;line-height:18px}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){i{animation-duration:1.8s}}
+      </style></head><body><main role="status"><i aria-hidden="true"></i><div><strong>正在定位子工作流日志</strong><small id="dify-subworkflow-pending-detail">正在匹配这次调用对应的运行记录…</small></div></main></body></html>`)
+      doc.close()
+    } catch {}
+  }
+
+  function updatePendingWindow(pending, message) {
+    if (!pending || pending.closed) return
+    try {
+      const detail = pending.document.getElementById('dify-subworkflow-pending-detail')
+      if (detail) detail.textContent = message
+    } catch {}
+  }
+
+  function startObserver(win) {
+    const begin = () => {
+      if (!win.document.body || state.observer) return
+      state.observer = new MutationObserver(() => scheduleScan(win))
+      state.observer.observe(win.document.body, { childList: true, subtree: true })
+    }
+    if (win.document.body) begin()
+    else win.document.addEventListener('DOMContentLoaded', begin, { once: true })
+  }
+
+  function removeSubworkflowButtons(doc) {
+    for (const button of doc.querySelectorAll(`.${BUTTON_CLASS}`)) button.remove()
+  }
+
+  function removeJsonEnhancements() {
+    for (const [card, enhancement] of state.decodedEditors) {
+      if (enhancement.original && enhancement.original.isConnected) enhancement.original.style.display = ''
+      if (enhancement.pre) enhancement.pre.remove()
+      if (enhancement.toggle) enhancement.toggle.remove()
+      if (enhancement.copy) enhancement.copy.remove()
+      state.decodedEditors.delete(card)
+    }
+  }
+
+  function applySettings(win) {
+    syncPlusButton(win)
+    if (!featureEnabled(win, 'subworkflowJump')) removeSubworkflowButtons(win.document)
+    if (!featureEnabled(win, 'jsonParsedView')) removeJsonEnhancements()
+    const loadingEnabled = featureEnabled(win, 'subworkflowJump') && featureEnabled(win, 'jumpLoading')
+    if (!loadingEnabled) clearDestinationLoader(win)
+    else if (anyDestinationFromLocation(win.location) && !win.document.getElementById(LOADER_ID))
+      activateDestinationLoader(win)
+    scheduleScan(win)
+  }
+
+  function scheduleScan(win) {
+    if (state.scanTimer) return
+    state.scanTimer = win.setTimeout(() => {
+      state.scanTimer = 0
+      injectPlusMenuButton(win)
+      if (featureEnabled(win, 'subworkflowJump')) {
+        tryAutoOpenDestination(win)
+        injectButtons(win)
+      }
+      if (featureEnabled(win, 'jsonParsedView')) enhanceJsonEditors(win)
+    }, 120)
+  }
+
+  function reactJsonEditorValue(element) {
+    let current = element
+    for (let elementDepth = 0; current && elementDepth < 5; elementDepth++, current = current.parentElement) {
+      for (const key of Object.getOwnPropertyNames(current)) {
+        if (!key.startsWith('__reactFiber$') && !key.startsWith('__reactInternalInstance$')) continue
+        let fiber = current[key]
+        for (let depth = 0; fiber && depth < 24; depth++, fiber = fiber.return) {
+          const props = fiber.memoizedProps || fiber.pendingProps
+          if (!props) continue
+          if (props.codeLanguages === 'json' && typeof props.value === 'string') return props.value
+          if (props.language === 'json' && props.readOnly && Object.prototype.hasOwnProperty.call(props, 'value'))
+            return typeof props.value === 'string' ? JSON.stringify(props.value) : JSON.stringify(props.value, null, 2)
+        }
+      }
+    }
+    return null
+  }
+
+  function findEditorContentRoot(card) {
+    let current = card.querySelector('.monaco-editor')
+    if (!current) return null
+    while (current.parentElement && current.parentElement !== card) current = current.parentElement
+    return current.parentElement === card ? current : null
+  }
+
+  function copyText(win, value) {
+    if (win.navigator.clipboard && win.navigator.clipboard.writeText)
+      return win.navigator.clipboard.writeText(value)
+    const textarea = win.document.createElement('textarea')
+    textarea.value = value
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    win.document.body.appendChild(textarea)
+    textarea.select()
+    win.document.execCommand('copy')
+    textarea.remove()
+    return Promise.resolve()
+  }
+
+  function enhanceJsonEditors(win) {
+    if (!/\/app\/[0-9a-fA-F-]+\/logs(?:\/|$)/.test(win.location.pathname)) return
+    const titleElements = [...win.document.querySelectorAll('div.system-xs-semibold-uppercase.text-text-secondary')]
+    for (const title of titleElements) {
+      const header = title.parentElement
+      const card = header && header.parentElement
+      if (!header || !card || !card.querySelector('.monaco-editor')) continue
+      const source = reactJsonEditorValue(card)
+      if (source === null) continue
+      const decoded = formatDecodedEditorValue(source)
+      let enhancement = state.decodedEditors.get(card)
+      if (!enhancement) {
+        const original = findEditorContentRoot(card)
+        if (!original) continue
+        const pre = win.document.createElement('pre')
+        pre.className = JSON_VIEW_CLASS
+        const controls = header.lastElementChild
+        if (!controls) continue
+        const toggle = win.document.createElement('button')
+        toggle.type = 'button'
+        toggle.className = 'dify-json-action'
+        toggle.textContent = '解析视图'
+        toggle.title = '切换到自动还原嵌套 JSON 的语法高亮视图'
+        toggle.addEventListener('click', event => {
+          event.preventDefault()
+          event.stopPropagation()
+          const parsedVisible = pre.style.display !== 'none'
+          pre.style.display = parsedVisible ? 'none' : 'block'
+          original.style.display = parsedVisible ? '' : 'none'
+          toggle.textContent = parsedVisible ? '解析视图' : '官方视图'
+          toggle.title = parsedVisible
+            ? '切换到自动还原嵌套 JSON 的语法高亮视图'
+            : '切换回 Dify 官方输出'
+        })
+        const copy = win.document.createElement('button')
+        copy.type = 'button'
+        copy.className = 'dify-json-action'
+        copy.textContent = '复制解析'
+        copy.addEventListener('click', event => {
+          event.preventDefault()
+          event.stopPropagation()
+          copyText(win, pre.textContent || '').then(() => {
+            copy.textContent = '已复制 ✓'
+            win.setTimeout(() => { copy.textContent = '复制解析' }, 1600)
+          }).catch(() => showToast(win.document, '复制失败，请选中文本后手动复制', 4000))
+        })
+        controls.prepend(copy, toggle)
+        pre.style.display = 'none'
+        original.before(pre)
+        enhancement = { source: null, pre, original, toggle, copy }
+        state.decodedEditors.set(card, enhancement)
+      }
+      if (enhancement.source !== source) {
+        enhancement.source = source
+        renderHighlightedJson(win.document, enhancement.pre, decoded)
+      }
+    }
+  }
+
+  function tryAutoOpenDestination(win) {
+    const testTarget = testDestinationFromLocation(win.location)
+    if (testTarget) {
+      tryAutoOpenTestDestination(win, testTarget)
+      return
+    }
+    const target = destinationFromLocation(win.location)
+    if (!target || state.destinationOpenedKey === target.key || !state.destinationResponseReady) return
+    const rows = [...win.document.querySelectorAll('tbody tr')].filter(row => row.offsetParent !== null)
+    if (!rows.length) return
+    state.destinationOpenedKey = target.key
+    updateDestinationLoader(win.document, '已定位运行记录，正在打开详情…')
+    rows[0].click()
+    clearDestinationLoader(win, 500)
+  }
+
+  function testRunHistoryButton(win) {
+    return [...win.document.querySelectorAll('button')].find(button =>
+      isVisibleElement(win, button) && button.querySelector('span.i-custom-vender-line-time-clock-play'),
+    ) || null
+  }
+
+  function visibleTestRunRows(win) {
+    const rows = []
+    for (const label of win.document.querySelectorAll('div')) {
+      if (!/^Test (?:Run|Chat)(?:\s|\(|$)/.test(String(label.textContent || '').trim())) continue
+      const row = label.closest('div.cursor-pointer')
+      if (row && isVisibleElement(win, row) && !rows.includes(row)) rows.push(row)
+    }
+    return rows
+  }
+
+  function tryAutoOpenTestDestination(win, target) {
+    if (state.destinationOpenedKey === target.key) return
+    if (!state.destinationTestHistoryOpened) {
+      const button = testRunHistoryButton(win)
+      if (!button) return
+      state.destinationTestHistoryOpened = true
+      updateDestinationLoader(win.document, '正在读取子 Workflow 的测试运行历史…')
+      button.click()
+      return
+    }
+    if (!state.destinationResponseReady || state.destinationTestRunIndex < 0) return
+    const rows = visibleTestRunRows(win)
+    const row = rows[state.destinationTestRunIndex]
+    if (!row) return
+    state.destinationOpenedKey = target.key
+    updateDestinationLoader(win.document, '已定位测试运行，正在加载 Trace…')
+    row.click()
+    clearDestinationLoader(win, 700)
+  }
+
+  function reactNodeInfo(element) {
+    let current = element
+    for (let elementDepth = 0; current && elementDepth < 5; elementDepth++, current = current.parentElement) {
+      for (const key of Object.getOwnPropertyNames(current)) {
+        if (!key.startsWith('__reactFiber$') && !key.startsWith('__reactInternalInstance$')) continue
+        let fiber = current[key]
+        for (let depth = 0; fiber && depth < 20; depth++, fiber = fiber.return) {
+          if (fiber.memoizedProps && fiber.memoizedProps.nodeInfo) return fiber.memoizedProps.nodeInfo
+          if (fiber.pendingProps && fiber.pendingProps.nodeInfo) return fiber.pendingProps.nodeInfo
+        }
+      }
+    }
+    return null
+  }
+
+  function contextForNodeInfo(nodeInfo) {
+    const active = state.runs.get(state.activeRunKey)
+    if (active && active.nodeExecutions && active.nodeExecutions.some(item => item.id === nodeInfo.id)) return active
+    for (const context of [...state.runs.values()].reverse()) {
+      if (context.nodeExecutions && context.nodeExecutions.some(item => item.id === nodeInfo.id)) return context
+    }
+    return null
+  }
+
+  function fallbackNodeInfo(header) {
+    const context = state.runs.get(state.activeRunKey)
+    if (!context || !context.nodeExecutions) return null
+    const title = [...header.querySelectorAll('div')]
+      .map(item => item.textContent && item.textContent.trim())
+      .find(text => text && text.length < 160)
+    if (!title) return null
+    const matches = context.nodeExecutions.filter(item => item.title === title)
+    return matches.length === 1 ? matches[0] : null
+  }
+
+  function injectButtons(win) {
+    const page = parseAppPath(win.location.pathname)
+    if (!page) return
+    const headers = [...win.document.querySelectorAll('div.cursor-pointer')]
+      .filter(element => element.classList.contains('items-center') && !element.querySelector(`.${BUTTON_CLASS}`))
+    for (const header of headers) {
+      const nodeInfo = reactNodeInfo(header) || fallbackNodeInfo(header)
+      if (!nodeInfo || String(nodeInfo.node_type).toLocaleLowerCase() !== 'tool') continue
+      const context = contextForNodeInfo(nodeInfo)
+      if (!context || !context.runDetail) continue
+      const graphNode = findGraphNode(context.runDetail, nodeInfo.node_id)
+      if (!isWorkflowToolGraphNode(graphNode)) continue
+
+      const button = win.document.createElement('button')
+      button.type = 'button'
+      button.className = BUTTON_CLASS
+      const source = runSourceForContext(win.location.pathname, context)
+      button.textContent = source === 'debugging' ? '子测试 ↗' : '子日志 ↗'
+      button.title = source === 'debugging'
+        ? '打开这次调用对应的子工作流测试运行 Trace'
+        : '打开这次调用对应的子工作流正式日志'
+      button.addEventListener('click', event => {
+        event.preventDefault()
+        event.stopPropagation()
+        event.stopImmediatePropagation()
+        locateAndOpen(win, button, context, nodeInfo, graphNode)
+      })
+      header.appendChild(button)
+    }
+  }
+
+  async function apiGet(win, path, params = {}) {
+    const currentPage = parseAppPath(win.location.pathname)
+    const apiRoot = state.apiRoot || `${currentPage && currentPage.basePath || ''}/console/api`
+    const url = new URL(`${apiRoot}${path}`, win.location.origin)
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== null && value !== undefined && value !== '') url.searchParams.set(key, String(value))
+    })
+    const headers = new Headers({ Accept: 'application/json', ...state.authHeaders })
+    if (!headers.has('authorization')) {
+      const token = win.localStorage && (win.localStorage.getItem('access_token') || win.localStorage.getItem('console_token'))
+      if (token) headers.set('authorization', `Bearer ${token}`)
+    }
+    const response = await state.rawFetch(url.href, { credentials: 'include', headers })
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) throw new Error('登录已失效或没有子工作流日志权限')
+      throw new Error(`Dify 接口返回 HTTP ${response.status}`)
+    }
+    return response.json()
+  }
+
+  async function workflowTools(win) {
+    if (state.workflowTools) return state.workflowTools
+    if (!state.workflowToolsPromise) {
+      state.workflowToolsPromise = apiGet(win, '/workspaces/current/tools/workflow')
+        .then(payload => (state.workflowTools = payload))
+        .finally(() => { state.workflowToolsPromise = null })
+    }
+    return state.workflowToolsPromise
+  }
+
+  async function childAppId(win, graphNode) {
+    const providerId = graphNode.data.provider_id || graphNode.data.providerId
+    const fromList = resolveChildAppId(await workflowTools(win), graphNode)
+    if (fromList) return fromList
+    const detail = await apiGet(win, '/workspaces/current/tool-provider/workflow/get', { workflow_tool_id: providerId })
+    return detail.workflow_app_id || detail.app_id || null
+  }
+
+  function cachedRunDetail(win, appId, runId) {
+    const key = `${appId}:${runId}`
+    if (state.runDetailPromises.has(key)) return state.runDetailPromises.get(key)
+    const promise = apiGet(win, `/apps/${appId}/workflow-runs/${runId}`)
+    state.runDetailPromises.set(key, promise)
+    promise.catch(() => {
+      if (state.runDetailPromises.get(key) === promise) state.runDetailPromises.delete(key)
+    })
+    return promise
+  }
+
+  function mergeRunDetails(...groups) {
+    const merged = new Map()
+    groups.flat().filter(Boolean).forEach(detail => merged.set(detail.id, detail))
+    return [...merged.values()]
+  }
+
+  async function candidateRunDetails(win, appId, nodeExecution, secondsPadding, keyword = '', onProgress = () => {}) {
+    const created = toEpochSeconds(nodeExecution.created_at)
+    const finished = toEpochSeconds(nodeExecution.finished_at) || created + (Number(nodeExecution.elapsed_time) || 0)
+    const params = { page: 1, limit: keyword ? KEYWORD_RESULT_LIMIT : NEARBY_RESULT_LIMIT }
+    if (keyword) params.keyword = keyword
+    if (created) params.created_at__after = new Date((created - secondsPadding) * 1000).toISOString()
+    if (finished) params.created_at__before = new Date((finished + secondsPadding) * 1000).toISOString()
+    const logs = asList(await apiGet(win, `/apps/${appId}/workflow-app-logs`, params))
+    const shortlisted = prefilterCandidateLogs(nodeExecution, logs)
+    const mode = keyword ? `关键词“${keyword}”` : `${secondsPadding} 秒时间窗口`
+    onProgress(`通过${mode}找到 ${logs.length} 条，正在比较最接近的 ${shortlisted.length} 条…`)
+    const values = await Promise.all(shortlisted.map(item =>
+      cachedRunDetail(win, appId, item.workflow_run.id).catch(() => null),
+    ))
+    return values.filter(Boolean)
+  }
+
+  async function candidateDebugRunDetails(win, appId, nodeExecution, secondsPadding = 180, onProgress = () => {}) {
+    const created = toEpochSeconds(nodeExecution.created_at)
+    const lowerBound = created ? created - secondsPadding : 0
+    const runs = []
+    let lastId = ''
+    let hasMore = true
+
+    for (let page = 0; page < 8 && hasMore; page++) {
+      const params = { limit: 100, triggered_from: 'debugging' }
+      if (lastId) params.last_id = lastId
+      const pageCursor = lastId
+      onProgress(`正在扫描子 Workflow 的测试运行历史（已读取 ${runs.length} 条）…`)
+      const payload = await apiGet(win, `/apps/${appId}/workflow-runs`, params)
+      const pageRuns = asList(payload)
+      runs.push(...pageRuns.map(run => ({ ...run, __difyPlusCursor: pageCursor })))
+      hasMore = Boolean(payload && payload.has_more) && pageRuns.length > 0
+      lastId = pageRuns.length ? String(pageRuns[pageRuns.length - 1].id || '') : ''
+      const oldest = pageRuns.length ? toEpochSeconds(pageRuns[pageRuns.length - 1].created_at) : 0
+      if (!lastId || (lowerBound && oldest && oldest <= lowerBound)) break
+    }
+
+    if (!runs.length)
+      throw new Error('子 Workflow 的测试历史接口返回 0 条 debugging 记录')
+    const matchingRuns = debugRunsInTimeWindow(nodeExecution, runs, secondsPadding)
+    if (!matchingRuns.length) {
+      const nodeStart = toEpochSeconds(nodeExecution.created_at)
+      const nearestDelta = nodeStart
+        ? Math.min(...runs.map(run => Math.abs(toEpochSeconds(run.created_at) - nodeStart)).filter(Number.isFinite))
+        : NaN
+      const deltaText = Number.isFinite(nearestDelta) ? `，最近记录相差 ${nearestDelta.toFixed(0)} 秒` : ''
+      throw new Error(`测试历史返回 ${runs.length} 条，但 ${secondsPadding} 秒时间窗口内为 0 条${deltaText}`)
+    }
+    const shortlisted = prefilterCandidateLogs(nodeExecution, matchingRuns)
+    onProgress(`仅在测试运行中找到 ${matchingRuns.length} 条时间候选，正在比较最接近的 ${shortlisted.length} 条…`)
+    const details = await Promise.all(shortlisted.map(async item => {
+      const detail = await cachedRunDetail(win, appId, item.workflow_run.id).catch(() => null)
+      return detail ? { ...detail, __difyPlusCursor: item.workflow_run.__difyPlusCursor || '' } : null
+    }))
+    const available = details.filter(detail => runDetailMatchesSource(detail, 'debugging'))
+    if (!available.length)
+      throw new Error(`找到 ${shortlisted.length} 条测试候选，但运行详情均无法读取`)
+    return available
+  }
+
+  async function locateChildRun(win, context, nodeExecution, graphNode, onProgress = () => {}) {
+    onProgress('正在读取子工作流配置…')
+    const appId = await childAppId(win, graphNode)
+    if (!appId || !UUID_RE.test(String(appId))) throw new Error('无法从 workflow tool 配置解析子应用 ID')
+
+    const source = runSourceForContext(win.location.pathname, context)
+    const directId = deepFindRunId(
+      {
+        process_data: nodeExecution.process_data,
+        outputs: nodeExecution.outputs,
+        execution_metadata: nodeExecution.execution_metadata,
+        extras: nodeExecution.extras,
+      },
+      context.runId,
+    )
+    if (directId) {
+      onProgress('已取得子 Run ID，正在验证运行记录…')
+      const detail = await cachedRunDetail(win, appId, directId).catch(() => null)
+      if (runDetailMatchesSource(detail, source))
+        return { appId, ranked: rankCandidates(nodeExecution, [detail]), direct: true, source }
+    }
+
+    if (source === 'debugging') {
+      onProgress('当前 Trace 来自测试运行，只查询 debugging 历史…')
+      const details = await candidateDebugRunDetails(win, appId, nodeExecution, 180, onProgress)
+      if (!details.length) throw new Error('没有在子 Workflow 的测试运行历史中找到时间匹配记录')
+      return { appId, ranked: rankCandidates(nodeExecution, details), direct: false, source }
+    }
+
+    const keyword = selectLogSearchKeyword(nodeExecution.inputs)
+    let unverifiedKeywordDetails = []
+    for (const secondsPadding of [20, 180]) {
+      if (keyword) {
+        onProgress(`正在用“${keyword}”筛选子日志…`)
+        const keywordDetails = await candidateRunDetails(
+          win, appId, nodeExecution, secondsPadding, keyword, onProgress,
+        )
+        if (keywordDetails.some(detail => inputsContainKeyword(detail.inputs, keyword)))
+          return { appId, ranked: rankCandidates(nodeExecution, keywordDetails), direct: false, source }
+        unverifiedKeywordDetails = mergeRunDetails(unverifiedKeywordDetails, keywordDetails)
+      }
+
+      onProgress(`正在检查执行时间附近 ${secondsPadding} 秒的子日志…`)
+      const nearbyDetails = await candidateRunDetails(
+        win, appId, nodeExecution, secondsPadding, '', onProgress,
+      )
+      if (nearbyDetails.length) {
+        const details = mergeRunDetails(unverifiedKeywordDetails, nearbyDetails)
+        return { appId, ranked: rankCandidates(nodeExecution, details), direct: false, source }
+      }
+    }
+    if (!unverifiedKeywordDetails.length)
+      throw new Error('没有找到时间匹配的子日志；调试运行和已清理的日志不会出现在 Logs 中')
+    return { appId, ranked: rankCandidates(nodeExecution, unverifiedKeywordDetails), direct: false, source }
+  }
+
+  function cachedChildLocation(win, context, nodeExecution, graphNode, onProgress) {
+    const key = `${context.appId}:${context.runId}:${nodeExecution.id}`
+    if (state.childLocationPromises.has(key)) {
+      onProgress('已使用本页缓存，正在打开运行记录…')
+      return state.childLocationPromises.get(key)
+    }
+    const promise = locateChildRun(win, context, nodeExecution, graphNode, onProgress)
+    state.childLocationPromises.set(key, promise)
+    promise.catch(() => {
+      if (state.childLocationPromises.get(key) === promise) state.childLocationPromises.delete(key)
+    })
+    return promise
+  }
+
+  async function locateAndOpen(win, button, context, nodeExecution, graphNode) {
+    if (button.disabled) return
+    button.disabled = true
+    const previous = button.textContent
+    button.textContent = '定位中…'
+    const pending = win.open('about:blank', '_blank')
+    if (pending) {
+      if (featureEnabled(win, 'jumpLoading')) renderPendingWindow(pending)
+      pending.opener = null
+    }
+    try {
+      const startedAt = Date.now()
+      const located = await cachedChildLocation(
+        win,
+        context,
+        nodeExecution,
+        graphNode,
+        message => updatePendingWindow(pending, message),
+      )
+      if (!located.ranked.length) throw new Error('没有可打开的子运行')
+      if (!located.direct && candidatesAreAmbiguous(located.ranked)) {
+        if (pending && !pending.closed) pending.close()
+        showCandidatePicker(win, located.appId, located.ranked, located.source)
+      } else {
+        updatePendingWindow(pending, `已定位，用时 ${((Date.now() - startedAt) / 1000).toFixed(1)} 秒，正在打开详情…`)
+        navigateToChild(
+          win, pending, located.appId, located.ranked[0].detail.id, located.source,
+          located.ranked[0].detail.__difyPlusCursor,
+        )
+      }
+      button.textContent = '已定位 ✓'
+      win.setTimeout(() => { button.textContent = previous }, 1800)
+    } catch (error) {
+      if (pending && !pending.closed) pending.close()
+      button.textContent = '定位失败'
+      showToast(win.document, error instanceof Error ? error.message : String(error), 7000)
+      win.setTimeout(() => { button.textContent = previous }, 2500)
+    } finally {
+      button.disabled = false
+    }
+  }
+
+  function navigateToChild(win, pending, appId, runId, source = 'logs', cursor = '') {
+    const page = parseAppPath(win.location.pathname) || { basePath: '' }
+    const url = source === 'debugging'
+      ? buildChildTestRunUrl(win.location.origin, page.basePath, appId, runId, cursor)
+      : buildChildLogUrl(win.location.origin, page.basePath, appId, runId)
+    let target = pending
+    if (!target || target.closed) {
+      target = win.open('about:blank', '_blank')
+      if (target) {
+        if (featureEnabled(win, 'jumpLoading')) renderPendingWindow(target)
+        target.opener = null
+      }
+    }
+    if (target && !target.closed) target.location.replace(url)
+    else win.open(url, '_blank', 'noopener,noreferrer')
+  }
+
+  function showCandidatePicker(win, appId, ranked, source = 'logs') {
+    const oldPicker = win.document.getElementById('dify-subworkflow-picker')
+    if (oldPicker) oldPicker.remove()
+    const overlay = win.document.createElement('div')
+    overlay.id = 'dify-subworkflow-picker'
+    const panel = win.document.createElement('div')
+    const heading = win.document.createElement('h2')
+    heading.textContent = source === 'debugging' ? '请选择子工作流测试运行' : '请选择子工作流日志'
+    const description = win.document.createElement('p')
+    description.textContent = '有多条日志的时间和输入相同，自动选择可能跳错。'
+    panel.append(heading, description)
+    ranked.slice(0, 8).forEach(item => {
+      const button = win.document.createElement('button')
+      const time = item.detail.created_at ? new Date(toEpochSeconds(item.detail.created_at) * 1000).toLocaleString() : '未知时间'
+      button.textContent = `${time}　${item.detail.status || 'unknown'}　输入匹配 ${(item.inputScore * 100).toFixed(0)}%　${item.detail.id}`
+      button.addEventListener('click', () => {
+        navigateToChild(win, null, appId, item.detail.id, source, item.detail.__difyPlusCursor)
+        overlay.remove()
+      })
+      panel.appendChild(button)
+    })
+    const close = win.document.createElement('button')
+    close.className = 'dify-picker-close'
+    close.textContent = '取消'
+    close.addEventListener('click', () => overlay.remove())
+    panel.appendChild(close)
+    overlay.appendChild(panel)
+    overlay.addEventListener('click', event => { if (event.target === overlay) overlay.remove() })
+    win.document.body.appendChild(overlay)
+  }
+
+  function showToast(doc, message, duration) {
+    const oldToast = doc.getElementById('dify-subworkflow-toast')
+    if (oldToast) oldToast.remove()
+    const toast = doc.createElement('div')
+    toast.id = 'dify-subworkflow-toast'
+    toast.textContent = message
+    doc.body.appendChild(toast)
+    setTimeout(() => toast.remove(), duration)
+  }
+
+  return {
+    QUERY_KEY,
+    TEST_QUERY_KEY,
+    TEST_CURSOR_KEY,
+    asList,
+    buildChildLogUrl,
+    buildChildTestRunUrl,
+    candidatesAreAmbiguous,
+    deepFindRunId,
+    decodeNestedJson,
+    decodeRunPayload,
+    destinationFromLocation,
+    testDestinationFromLocation,
+    debugRunsInTimeWindow,
+    findGraphNode,
+    flattenComparable,
+    inputsContainKeyword,
+    formatDecodedEditorValue,
+    inputSimilarity,
+    installVisibilityRefreshGuard,
+    isDifyWorkflowEditor,
+    isWorkflowToolGraphNode,
+    parseAppPath,
+    parseLogApi,
+    parseRunListApi,
+    parseMaybeJson,
+    parseRunApi,
+    rankCandidates,
+    prefilterCandidateLogs,
+    tokenizeJson,
+    resolveChildAppId,
+    selectLogSearchKeyword,
+    rewriteDestinationLogUrl,
+    rewriteDestinationTestRunUrl,
+    runDetailMatchesSource,
+    runSourceForContext,
+    runSourceFromPath,
+    toEpochSeconds,
+    boot,
+  }
+})

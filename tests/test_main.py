@@ -12,6 +12,7 @@ class FakeAPI:
 
     def __init__(self):
         self.tool_detail_requests = []
+        self.tool_index_requests = 0
 
     def list_tags(self):
         return [{"id": "tag-1", "name": "release-1"}]
@@ -25,6 +26,7 @@ class FakeAPI:
         return apps[:1] if tag_id else apps
 
     def list_workflow_tools(self):
+        self.tool_index_requests += 1
         return [
             {
                 "id": "tool-child",
@@ -124,6 +126,31 @@ def test_visible_browser_closes_and_export_continues_headless(
     assert session.page is page
 
 
+def test_successful_context_request_skips_page_fallback(monkeypatch, tmp_path) -> None:
+    session = ConsoleSession("https://dify.example.com", tmp_path)
+    page_requests = []
+    monkeypatch.setattr(session, "_csrf_headers", lambda: {})
+    monkeypatch.setattr(
+        session,
+        "_via_context",
+        lambda *args: {
+            "ok": True,
+            "status": 200,
+            "text": "{}",
+            "json": {"data": []},
+            "strategy": "context.request",
+        },
+    )
+    monkeypatch.setattr(
+        session,
+        "_via_page",
+        lambda *args: page_requests.append(args),
+    )
+
+    assert session._request_json("/apps") == {"data": []}
+    assert page_requests == []
+
+
 def test_exports_named_tagged_app_and_recursive_dependency(tmp_path) -> None:
     progress = []
     api = FakeAPI()
@@ -141,7 +168,24 @@ def test_exports_named_tagged_app_and_recursive_dependency(tmp_path) -> None:
     assert any("[1] Pulling DSL: Parent" in line for line in progress)
     assert any("Renamed Child.yml" in line for line in progress)
     assert any("manifest.json" in line for line in progress)
+    assert api.tool_index_requests == 1
     assert api.tool_detail_requests == ["tool-child"]
+
+
+def test_skips_tool_registry_when_app_names_resolve_dependencies(tmp_path) -> None:
+    api = FakeAPI()
+    api.export_dsl = lambda app_id: (
+        "app:\n  name: Parent\nworkflow:\n  graph:\n    nodes:\n"
+        "      - data:\n          type: tool\n          provider_type: workflow\n"
+        "          provider_name: Grandchild\n"
+        if app_id == "app-parent"
+        else "app:\n  name: Grandchild\nworkflow:\n  graph:\n    nodes: []\n"
+    )
+
+    manifest = export_complete_dsl(api, "Parent", "release-1", tmp_path)
+
+    assert manifest["workflow_count"] == 2
+    assert api.tool_index_requests == 0
 
 
 def test_requires_name_to_match_within_tag(tmp_path) -> None:
