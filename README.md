@@ -86,10 +86,10 @@ dsl-export --endpoint "https://dify-devs.maersk-digital.net" --name "split combi
 
 ```powershell
 dify-log-search `
-	--endpoint "https://dify-devs.maersk-digital.net" `
+	--endpoint "https://dify-cxprod.maersk-digital.net" `
 	--app "split combine endpoint" `
 	--case-num "123456789" `
-	--workspace "CX Emails - China" `
+	--workspace "CX-P-CN-Amend Booking Core" `
 	--output ".\dify-log-search"
 ```
 
